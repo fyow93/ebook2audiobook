@@ -131,6 +131,8 @@ Linux/Mac:
     ./ebook2audiobook.sh
     Headless mode:
     ./ebook2audiobook.sh --headless --ebook '/path/to/file'
+    Multi-GPU mode:
+    python multirun.py --headless --ebook '/path/to/file'
         ''',
         formatter_class=argparse.RawTextHelpFormatter
     )
@@ -140,7 +142,7 @@ Linux/Mac:
         '--custom_model', '--fine_tuned', '--output_format',
         '--temperature', '--length_penalty', '--num_beams', '--repetition_penalty',
         '--top_k', '--top_p', '--speed', '--enable_text_splitting', 
-        '--output_dir', '--version', '--workflow', '--help'
+        '--output_dir', '--version', '--workflow', '--help', '--gpu_id'
     ]
     #tts_engine_list = [k for k in models.keys() if k != BARK]
     tts_engine_list = [k for k in models.keys()]
@@ -188,6 +190,7 @@ Linux/Mac:
     headless_optional_group.add_argument(options[21], type=str, help=f'''(Optional) Path to the output directory. Default is set in ./lib/conf.py''')
     headless_optional_group.add_argument(options[22], action='version', version=f'ebook2audiobook version {prog_version}', help='''Show the version of the script and exit''')
     headless_optional_group.add_argument(options[23], action='store_true', help=argparse.SUPPRESS)
+    headless_optional_group.add_argument('--gpu_id', type=int, default=0, help='''(Optional) GPU ID for distributed processing. Used internally by multirun.py.''')
     
     for arg in sys.argv:
         if arg.startswith('--') and arg not in options:
@@ -246,6 +249,12 @@ Linux/Mac:
             if args['custom_model']:
                 if os.path.exists(args['custom_model']):
                     args['custom_model'] = os.path.abspath(args['custom_model'])
+                    
+            # 设置特定的GPU设备（用于分布式处理）
+            if 'gpu_id' in args and args['gpu_id'] is not None and args['device'] == 'cuda':
+                print(f"使用GPU ID: {args['gpu_id']}")
+                os.environ["CUDA_VISIBLE_DEVICES"] = str(args['gpu_id'])
+                
             if not os.path.exists(args['audiobooks_dir']):
                 error = 'Error: --output_dir path does not exist.'
                 print(error)

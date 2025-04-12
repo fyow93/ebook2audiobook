@@ -10,6 +10,9 @@ import torch
 import torchaudio
 import threading
 import uuid
+import json
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from fastapi import FastAPI
 from huggingface_hub import hf_hub_download
@@ -49,44 +52,92 @@ def load_coqui_tts_api(model_path, device):
 @app.post("/load_coqui_tts_checkpoint/")
 def load_coqui_tts_checkpoint(model_path, config_path, vocab_path, device):
     try:
+        # 设置环境变量确保使用所有GPU
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"  # 使用所有4个GPU
+        
+        # 检测可用GPU数量
+        num_gpus = torch.cuda.device_count()
+        print(f"检测到 {num_gpus} 个GPU设备")
+        
+        # 初始化DeepSpeed的分布式环境
+        if num_gpus > 1 and default_xtts_settings['use_deepspeed']:
+            # 尝试初始化分布式环境
+            try:
+                if not dist.is_initialized():
+                    # 设置当前进程为主进程
+                    os.environ['MASTER_ADDR'] = 'localhost'
+                    os.environ['MASTER_PORT'] = '29500'
+                    os.environ['RANK'] = '0'
+                    os.environ['WORLD_SIZE'] = str(num_gpus)
+                    os.environ['LOCAL_RANK'] = '0'
+                    
+                    # 初始化进程组
+                    dist.init_process_group(backend='nccl')
+                    print(f"分布式环境已初始化: 总进程数={num_gpus}")
+            except Exception as e:
+                print(f"初始化分布式环境失败: {e}")
+                print("回退到单GPU模式")
+        
+        # 加载配置
         config = XttsConfig()
         config.models_dir = os.path.join("models", "tts")
         config.load_json(config_path)
-        tts = Xtts.init_from_config(config)
         
-        # 加载 DeepSpeed 配置
+        # 加载DeepSpeed配置
         ds_config = None
-        if default_xtts_settings['use_deepspeed']:
+        if default_xtts_settings['use_deepspeed'] and num_gpus > 1:
             try:
-                import json
                 if os.path.exists("ds_config.json"):
                     with open("ds_config.json", "r") as f:
                         ds_config = json.load(f)
-                    print("Loaded DeepSpeed configuration")
+                    print("已加载DeepSpeed配置")
+                    
+                    # 确保配置兼容多GPU
+                    if 'zero_optimization' in ds_config:
+                        print(f"使用ZeRO优化阶段: {ds_config['zero_optimization']['stage']}")
             except Exception as e:
-                print(f"Failed to load DeepSpeed configuration: {e}")
+                print(f"加载DeepSpeed配置失败: {e}")
                 default_xtts_settings['use_deepspeed'] = False
+        
+        # 初始化TTS模型
+        tts = Xtts.init_from_config(config)
         
         with lock:
             tts.load_checkpoint(
                 config,
                 checkpoint_path=model_path,
                 vocab_path=vocab_path,
-                use_deepspeed=default_xtts_settings['use_deepspeed'],
+                use_deepspeed=default_xtts_settings['use_deepspeed'] and num_gpus > 1,
                 eval=True,
                 deepspeed_config=ds_config
             )
-            
-        # 适用于多卡
-        if device == 'cuda' and torch.cuda.device_count() > 1:
-            print(f"Using {torch.cuda.device_count()} GPUs for inference")
-            # 对于多卡推理，使用DataParallel
-            tts = torch.nn.DataParallel(tts)
-            tts.cuda()
+        
+        # 多GPU处理
+        if device == 'cuda' and num_gpus > 1:
+            try:
+                # 使用DistributedDataParallel来确保正确使用多GPU
+                # 首先将模型移到当前设备
+                if dist.is_initialized():
+                    # 使用DDP进行包装
+                    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+                    print(f"在GPU {local_rank}上初始化DDP模型")
+                    tts.cuda(local_rank)
+                    tts = DDP(tts, device_ids=[local_rank], output_device=local_rank)
+                else:
+                    # 回退到DataParallel
+                    print("使用DataParallel进行多GPU推理")
+                    tts = torch.nn.DataParallel(tts)
+                    tts.cuda()
+                print(f"模型已分布在{num_gpus}个GPU上")
+            except Exception as e:
+                print(f"多GPU初始化失败: {e}")
+                print("回退到单GPU模式")
+                tts.cuda()
         elif device == 'cuda':
             tts.cuda()
         else:
             tts.to(device)
+            
         return tts
     except Exception as e:
         error = f'load_coqui_tts_checkpoint() error: {e}'

@@ -6,6 +6,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import torch
 
 from pathlib import Path
 
@@ -251,10 +252,35 @@ Linux/Mac:
                 if os.path.exists(args['custom_model']):
                     args['custom_model'] = os.path.abspath(args['custom_model'])
                     
-            # 设置特定的GPU设备（用于分布式处理）
-            if 'gpu_id' in args and args['gpu_id'] is not None and args['device'] == 'cuda':
-                print(f"使用GPU ID: {args['gpu_id']}")
-                os.environ["CUDA_VISIBLE_DEVICES"] = str(args['gpu_id'])
+            # 分布式处理设置
+            if args['use_distributed'] and args['device'] == 'cuda':
+                gpu_id = args['gpu_id']
+                print(f"分布式模式下使用GPU ID: {gpu_id}")
+                
+                # 检查可用的GPU
+                total_gpus = torch.cuda.device_count()
+                if total_gpus > 0:
+                    if gpu_id >= total_gpus:
+                        print(f"警告: 指定的GPU ID {gpu_id} 超出可用范围，将使用GPU 0")
+                        gpu_id = 0
+                    
+                    # 设置当前进程使用的GPU
+                    try:
+                        # 明确设置当前设备
+                        torch.cuda.set_device(gpu_id)
+                        print(f"当前进程已设置为使用GPU {gpu_id}")
+                        
+                        # 获取当前设备的名称和内存信息
+                        current_device = torch.cuda.current_device()
+                        device_name = torch.cuda.get_device_name(current_device)
+                        total_memory = torch.cuda.get_device_properties(current_device).total_memory / (1024**3)
+                        print(f"当前使用的GPU设备: {device_name}, 显存: {total_memory:.2f} GB")
+                    except Exception as e:
+                        print(f"设置GPU设备时出错: {e}")
+                        print("回退到默认GPU设置")
+                else:
+                    print("未检测到可用的GPU，将回退到CPU模式")
+                    args['device'] = 'cpu'
                 
             if not os.path.exists(args['audiobooks_dir']):
                 error = 'Error: --output_dir path does not exist.'

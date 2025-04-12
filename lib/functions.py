@@ -1395,13 +1395,39 @@ def convert_ebook(args):
                         if default_xtts_settings['use_deepspeed'] == True:
                             try:
                                 import deepspeed
-                            except:
+                                # 检查是否在分布式环境中
+                                is_distributed = 'RANK' in os.environ and 'WORLD_SIZE' in os.environ
+                                
+                                if is_distributed:
+                                    rank = int(os.environ.get('RANK', '0'))
+                                    local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+                                    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+                                    
+                                    msg = f'检测到分布式环境: rank={rank}, local_rank={local_rank}, world_size={world_size}'
+                                    print(msg)
+                                    
+                                    # 在首次加载模型时将启用DeepSpeed
+                                    default_xtts_settings['is_distributed'] = True
+                                    default_xtts_settings['rank'] = rank
+                                    default_xtts_settings['local_rank'] = local_rank
+                                    default_xtts_settings['world_size'] = world_size
+                                    
+                                    msg = 'DeepSpeed分布式设置已配置!'
+                                    print(msg)
+                                else:
+                                    msg = 'DeepSpeed已安装，但未检测到分布式环境，将使用单GPU模式'
+                                    print(msg)
+                            except ImportError:
                                 default_xtts_settings['use_deepspeed'] = False
-                                msg = 'deepseed not installed or package is broken. set to False'
+                                msg = 'deepspeed未安装或包损坏。已设置为False'
                                 print(msg)
-                            else: 
-                                msg = 'deepspeed is detected!'
+                            except Exception as e:
+                                default_xtts_settings['use_deepspeed'] = False
+                                msg = f'DeepSpeed初始化错误: {str(e)}。已设置为False'
                                 print(msg)
+                        else:
+                            msg = 'DeepSpeed未启用'
+                            print(msg)
                         session['epub_path'] = os.path.join(session['process_dir'], '__' + session['filename_noext'] + '.epub')
                         if convert_to_epub(session):
                             epubBook = epub.read_epub(session['epub_path'], {'ignore_ncx': True})       

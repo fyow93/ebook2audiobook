@@ -33,11 +33,22 @@ default_xtts_settings = {
     "top_p": 0.85,
     "speed": 1.0,
     "enable_text_splitting": False,
-    # to enable_deepspeed, it must be installed manually.
-    # conda activate ./python_env (linux/mac) or .\python_env (windows)
-    # pip install deepspeed
-    # conda deactivate
+    # DeepSpeed now enabled by default
     "use_deepspeed": True,
+    "is_distributed": False,  # Will be updated in distributed environments
+    "rank": 0,
+    "local_rank": 0,
+    "world_size": 1,
+    # Default DeepSpeed configuration
+    "deepspeed_config": {
+        "train_batch_size": 1,
+        "fp16": {"enabled": True},
+        "zero_optimization": {
+            "stage": 2,
+            "offload_optimizer": {"device": "cpu"}
+        },
+        "gradient_accumulation_steps": 1
+    },
     "files": ['config.json', 'model.pth', 'vocab.json', 'ref.wav'],
     "voices": {
         "ClaribelDervla": "Claribel Dervla", "DaisyStudious": "Daisy Studious", "GracieWise": "Gracie Wise",

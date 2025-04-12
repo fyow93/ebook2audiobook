@@ -193,9 +193,9 @@ Linux/Mac:
     headless_optional_group.add_argument(options[22], action='version', version=f'ebook2audiobook version {prog_version}', help='''Show the version of the script and exit''')
     headless_optional_group.add_argument(options[23], action='store_true', help=argparse.SUPPRESS)
     headless_optional_group.add_argument('--gpu_id', type=int, default=0, help='''(Optional) GPU ID for distributed processing. Used internally by multirun.py.''')
-    parser.add_argument('--use_distributed', type=bool, default=False, help='''(Optional) Enable distributed processing mode. Used internally by multirun.py.''')
+    parser.add_argument('--use_distributed', type=bool, default=True, help='''(Optional) Enable distributed processing mode. Used internally by multirun.py. Default: True''')
     # DeepSpeed相关参数
-    parser.add_argument('--deepspeed', action='store_true', help='''(Optional) Enable DeepSpeed for multi-GPU acceleration.''')
+    parser.add_argument('--deepspeed', action='store_true', default=True, help='''(Optional) Enable DeepSpeed for multi-GPU acceleration. Default: True''')
     parser.add_argument('--deepspeed_config', type=str, default=None, help='''(Optional) Path to DeepSpeed configuration file.''')
     
     for arg in sys.argv:
@@ -257,9 +257,10 @@ Linux/Mac:
                     args['custom_model'] = os.path.abspath(args['custom_model'])
                     
             # 分布式处理设置
-            if args['use_distributed'] and args['device'] == 'cuda':
+            if args['device'] == 'cuda':
                 gpu_id = args['gpu_id']
-                print(f"分布式模式下使用GPU ID: {gpu_id}")
+                use_distributed = True if 'use_distributed' not in args else args['use_distributed']
+                print(f"CUDA模式下使用GPU ID: {gpu_id}, 分布式模式: {'开启' if use_distributed else '关闭'}")
                 
                 # 检查可用的GPU
                 total_gpus = torch.cuda.device_count()
@@ -280,31 +281,44 @@ Linux/Mac:
                         total_memory = torch.cuda.get_device_properties(current_device).total_memory / (1024**3)
                         print(f"当前使用的GPU设备: {device_name}, 显存: {total_memory:.2f} GB")
                         
-                        # 检查DeepSpeed配置
-                        if 'deepspeed' in args and args['deepspeed']:
-                            try:
-                                # 尝试导入DeepSpeed
-                                import deepspeed
-                                print("DeepSpeed已加载，将用于分布式加速")
-                                
-                                # 如果提供了配置文件路径，则读取配置
-                                if 'deepspeed_config' in args and args['deepspeed_config']:
-                                    if os.path.exists(args['deepspeed_config']):
-                                        import json
-                                        with open(args['deepspeed_config'], 'r') as f:
-                                            ds_config = json.load(f)
-                                        print(f"已加载DeepSpeed配置文件: {args['deepspeed_config']}")
-                                        
-                                        # 将DeepSpeed配置传递给lib/models.py中的settings
-                                        from lib.models import default_xtts_settings
-                                        default_xtts_settings['deepspeed_config'] = ds_config
-                                        print("DeepSpeed配置已传递给TTS设置")
-                                    else:
-                                        print(f"警告: DeepSpeed配置文件未找到: {args['deepspeed_config']}")
-                            except ImportError:
-                                print("警告: DeepSpeed未安装，无法启用DeepSpeed加速")
-                            except Exception as e:
-                                print(f"配置DeepSpeed时出错: {e}")
+                        # 启用DeepSpeed（现在默认开启）
+                        try:
+                            # 尝试导入DeepSpeed
+                            import deepspeed
+                            print("DeepSpeed已加载，将用于分布式加速")
+                            
+                            # 默认配置或从文件加载配置
+                            ds_config = None
+                            
+                            # 如果提供了配置文件路径，则读取配置
+                            if 'deepspeed_config' in args and args['deepspeed_config']:
+                                if os.path.exists(args['deepspeed_config']):
+                                    import json
+                                    with open(args['deepspeed_config'], 'r') as f:
+                                        ds_config = json.load(f)
+                                    print(f"已加载DeepSpeed配置文件: {args['deepspeed_config']}")
+                            
+                            # 将DeepSpeed配置传递给lib/models.py中的settings
+                            from lib.models import default_xtts_settings
+                            
+                            if ds_config:
+                                default_xtts_settings['deepspeed_config'] = ds_config
+                            
+                            # 设置分布式参数
+                            if 'RANK' in os.environ:
+                                default_xtts_settings['is_distributed'] = True
+                                default_xtts_settings['rank'] = int(os.environ.get('RANK', '0'))
+                                default_xtts_settings['local_rank'] = int(os.environ.get('LOCAL_RANK', '0'))
+                                default_xtts_settings['world_size'] = int(os.environ.get('WORLD_SIZE', '1'))
+                                print(f"分布式参数已设置: rank={default_xtts_settings['rank']}, "
+                                     f"local_rank={default_xtts_settings['local_rank']}, "
+                                     f"world_size={default_xtts_settings['world_size']}")
+                            
+                            print("DeepSpeed配置已应用")
+                        except ImportError:
+                            print("警告: DeepSpeed未安装，无法启用DeepSpeed加速")
+                        except Exception as e:
+                            print(f"配置DeepSpeed时出错: {e}")
                     except Exception as e:
                         print(f"设置GPU设备时出错: {e}")
                         print("回退到默认GPU设置")

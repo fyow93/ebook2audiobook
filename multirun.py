@@ -74,7 +74,8 @@ def run_worker(rank, world_size, args, gpu_ids):
     # 添加或修改为分布式模式必须的参数
     cmd_args.extend([
         '--gpu_id', str(gpu_id),
-        '--use_distributed', 'True'
+        '--use_distributed', 'True',
+        '--deepspeed'  # 默认开启DeepSpeed
     ])
     
     # 检查是否已经有--headless参数
@@ -82,7 +83,7 @@ def run_worker(rank, world_size, args, gpu_ids):
         cmd_args.append('--headless')
         
     # 如果有需要，可以添加DeepSpeed特定的参数
-    if '--tts_engine' in cmd_args and cmd_args[cmd_args.index('--tts_engine') + 1] == 'xtts':
+    if '--tts_engine' not in cmd_args or ('--tts_engine' in cmd_args and cmd_args[cmd_args.index('--tts_engine') + 1] == 'xtts'):
         # 为DeepSpeed创建临时配置文件
         ds_config = {
             "train_batch_size": 1,
@@ -101,7 +102,6 @@ def run_worker(rank, world_size, args, gpu_ids):
         
         # 添加DeepSpeed相关参数
         cmd_args.extend([
-            '--deepspeed',
             '--deepspeed_config', temp_ds_config
         ])
     

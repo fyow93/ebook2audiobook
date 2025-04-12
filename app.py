@@ -142,7 +142,7 @@ Linux/Mac:
         '--custom_model', '--fine_tuned', '--output_format',
         '--temperature', '--length_penalty', '--num_beams', '--repetition_penalty',
         '--top_k', '--top_p', '--speed', '--enable_text_splitting', 
-        '--output_dir', '--version', '--workflow', '--help', '--gpu_id'
+        '--output_dir', '--version', '--workflow', '--help', '--gpu_id', '--use_distributed'
     ]
     #tts_engine_list = [k for k in models.keys() if k != BARK]
     tts_engine_list = [k for k in models.keys()]
@@ -191,6 +191,7 @@ Linux/Mac:
     headless_optional_group.add_argument(options[22], action='version', version=f'ebook2audiobook version {prog_version}', help='''Show the version of the script and exit''')
     headless_optional_group.add_argument(options[23], action='store_true', help=argparse.SUPPRESS)
     headless_optional_group.add_argument('--gpu_id', type=int, default=0, help='''(Optional) GPU ID for distributed processing. Used internally by multirun.py.''')
+    parser.add_argument('--use_distributed', type=bool, default=False, help='''(Optional) Enable distributed processing mode. Used internally by multirun.py.''')
     
     for arg in sys.argv:
         if arg.startswith('--') and arg not in options:

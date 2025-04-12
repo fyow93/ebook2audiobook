@@ -55,28 +55,43 @@ def load_coqui_tts_checkpoint(model_path, config_path, vocab_path, device):
         # 设置环境变量确保使用所有GPU
         os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"  # 使用所有4个GPU
         
+        # 获取当前GPU ID (如果是分布式模式)
+        gpu_id = int(os.environ.get('LOCAL_RANK', '0'))
+        print(f"当前进程使用GPU ID: {gpu_id}")
+        
         # 检测可用GPU数量
         num_gpus = torch.cuda.device_count()
         print(f"检测到 {num_gpus} 个GPU设备")
+        
+        # 判断是否为分布式模式
+        is_distributed = os.environ.get('RANK') is not None and os.environ.get('WORLD_SIZE') is not None
+        if is_distributed:
+            print(f"运行在分布式模式下: RANK={os.environ.get('RANK')}, WORLD_SIZE={os.environ.get('WORLD_SIZE')}")
         
         # 初始化DeepSpeed的分布式环境
         if num_gpus > 1 and default_xtts_settings['use_deepspeed']:
             # 尝试初始化分布式环境
             try:
-                if not dist.is_initialized():
-                    # 设置当前进程为主进程
-                    os.environ['MASTER_ADDR'] = 'localhost'
-                    os.environ['MASTER_PORT'] = '29500'
-                    os.environ['RANK'] = '0'
-                    os.environ['WORLD_SIZE'] = str(num_gpus)
-                    os.environ['LOCAL_RANK'] = '0'
-                    
-                    # 初始化进程组
-                    dist.init_process_group(backend='nccl')
-                    print(f"分布式环境已初始化: 总进程数={num_gpus}")
+                if not dist.is_initialized() and is_distributed:
+                    # 使用当前进程的分布式环境
+                    dist_backend = "nccl"  # GPU推荐使用nccl
+                    print(f"初始化分布式进程组: {dist_backend}")
+                    dist.init_process_group(backend=dist_backend)
+                    print(f"分布式环境已初始化")
             except Exception as e:
                 print(f"初始化分布式环境失败: {e}")
                 print("回退到单GPU模式")
+                
+        # 明确设置当前设备
+        if device == 'cuda':
+            # 在分布式模式下，使用分配的GPU
+            if is_distributed:
+                torch.cuda.set_device(gpu_id)
+                current_device = torch.cuda.current_device()
+                print(f"已设置为GPU {current_device}")
+            else:
+                # 非分布式模式下使用GPU 0
+                torch.cuda.set_device(0)
         
         # 加载配置
         config = XttsConfig()
@@ -121,16 +136,33 @@ def load_coqui_tts_checkpoint(model_path, config_path, vocab_path, device):
                     # 使用DDP进行包装
                     local_rank = int(os.environ.get('LOCAL_RANK', 0))
                     print(f"在GPU {local_rank}上初始化DDP模型")
-                    tts.cuda(local_rank)
-                    tts = DDP(tts, device_ids=[local_rank], output_device=local_rank)
+                    
+                    # 确保只用指定的GPU
+                    torch.cuda.set_device(local_rank)
+                    device_id = torch.cuda.current_device()
+                    print(f"强制设置为设备: cuda:{device_id}")
+                    
+                    # 将模型放置到指定GPU
+                    tts.cuda(device_id)
+                    
+                    # 包装为分布式模型
+                    from torch.nn.parallel import DistributedDataParallel
+                    tts = DistributedDataParallel(
+                        tts, 
+                        device_ids=[device_id], 
+                        output_device=device_id,
+                        find_unused_parameters=True
+                    )
+                    print(f"DistributedDataParallel初始化成功")
                 else:
                     # 回退到DataParallel
-                    print("使用DataParallel进行多GPU推理")
+                    print("使用DataParallel进行多GPU推理 (不推荐，效率较低)")
                     tts = torch.nn.DataParallel(tts)
                     tts.cuda()
                 print(f"模型已分布在{num_gpus}个GPU上")
             except Exception as e:
                 print(f"多GPU初始化失败: {e}")
+                print(f"错误详情: {str(e)}")
                 print("回退到单GPU模式")
                 tts.cuda()
         elif device == 'cuda':

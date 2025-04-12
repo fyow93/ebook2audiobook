@@ -648,6 +648,9 @@ def get_sentences(text, lang):
 
     def split_sentence(sentence):
         end = ''
+        # 首先检查是否为空字符串
+        if not sentence:
+            return []
         if len(sentence) <= max_chars:
             if sentence[-1].isalpha():
                 end = '–'
@@ -716,18 +719,31 @@ def get_sentences(text, lang):
 
 def get_vram():
     os_name = platform.system()
+    total_vram = 0
     # NVIDIA (Cross-Platform: Windows, Linux, macOS)
     try:
-        from pynvml import nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetMemoryInfo
+        from pynvml import nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetMemoryInfo, nvmlDeviceGetCount
         nvmlInit()
-        handle = nvmlDeviceGetHandleByIndex(0)  # First GPU
-        info = nvmlDeviceGetMemoryInfo(handle)
-        vram = info.total
-        return int(vram / (1024 ** 3))  # Convert to GB
+        num_gpus = nvmlDeviceGetCount()
+        print(f"Detected {num_gpus} NVIDIA GPUs")
+        
+        # 返回所有GPU的总VRAM
+        for i in range(num_gpus):
+            handle = nvmlDeviceGetHandleByIndex(i)
+            info = nvmlDeviceGetMemoryInfo(handle)
+            gpu_vram = int(info.total / (1024 ** 3))  # Convert to GB
+            print(f"GPU {i} has {gpu_vram} GB VRAM")
+            total_vram += gpu_vram
+        
+        if total_vram > 0:
+            return total_vram
     except ImportError:
         pass
     except Exception as e:
-        pass
+        print(f"NVIDIA GPU detection error: {e}")
+    
+    # 后续AMD和Intel GPU检测代码保持不变
+    # 以下为原始代码
     # AMD (Windows)
     if os_name == "Windows":
         try:
@@ -793,6 +809,12 @@ def convert_chapters_to_audio(session):
         tts_manager = TTSManager(session, is_gui_process)
         if tts_manager.params['tts'] is None:
             return False
+            
+        # 初始化多GPU支持
+        use_multi_gpu = (session['device'] == 'cuda' and torch.cuda.device_count() > 1)
+        if use_multi_gpu:
+            print(f"Using {torch.cuda.device_count()} GPUs for audio conversion")
+            
         resume_chapter = 0
         missing_chapters = []
         resume_sentence = 0

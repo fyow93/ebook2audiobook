@@ -37,7 +37,7 @@ default_xtts_settings = {
     # conda activate ./python_env (linux/mac) or .\python_env (windows)
     # pip install deepspeed
     # conda deactivate
-    "use_deepspeed": False,
+    "use_deepspeed": True,
     "files": ['config.json', 'model.pth', 'vocab.json', 'ref.wav'],
     "voices": {
         "ClaribelDervla": "Claribel Dervla", "DaisyStudious": "Daisy Studious", "GracieWise": "Gracie Wise",

@@ -53,15 +53,37 @@ def load_coqui_tts_checkpoint(model_path, config_path, vocab_path, device):
         config.models_dir = os.path.join("models", "tts")
         config.load_json(config_path)
         tts = Xtts.init_from_config(config)
+        
+        # 加载 DeepSpeed 配置
+        ds_config = None
+        if default_xtts_settings['use_deepspeed']:
+            try:
+                import json
+                if os.path.exists("ds_config.json"):
+                    with open("ds_config.json", "r") as f:
+                        ds_config = json.load(f)
+                    print("Loaded DeepSpeed configuration")
+            except Exception as e:
+                print(f"Failed to load DeepSpeed configuration: {e}")
+                default_xtts_settings['use_deepspeed'] = False
+        
         with lock:
             tts.load_checkpoint(
                 config,
                 checkpoint_path=model_path,
                 vocab_path=vocab_path,
                 use_deepspeed=default_xtts_settings['use_deepspeed'],
-                eval=True
+                eval=True,
+                deepspeed_config=ds_config
             )
-        if device == 'cuda':
+            
+        # 适用于多卡
+        if device == 'cuda' and torch.cuda.device_count() > 1:
+            print(f"Using {torch.cuda.device_count()} GPUs for inference")
+            # 对于多卡推理，使用DataParallel
+            tts = torch.nn.DataParallel(tts)
+            tts.cuda()
+        elif device == 'cuda':
             tts.cuda()
         else:
             tts.to(device)

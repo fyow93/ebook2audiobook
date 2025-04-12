@@ -469,3 +469,23 @@ For an XTTS custom model a ref audio clip of the voice reference is mandatory:
 - **Calibre**: [Calibre Website](https://calibre-ebook.com)
 - **FFmpeg**: [FFmpeg Website](https://ffmpeg.org)
 - [@shakenbake15 for better chapter saving method](https://github.com/DrewThomasson/ebook2audiobook/issues/8) 
+
+## 多GPU支持（张量并行）
+
+为了在多GPU环境下获得更好的性能，ebook2audiobook现在支持以下功能：
+
+1. **自动检测多GPU**: 系统会自动检测所有可用的GPU并合理使用它们。
+
+2. **启用DeepSpeed**: 默认启用DeepSpeed支持，可以通过多GPU加速处理。
+
+3. **使用方法**:
+   - 确保已安装deepspeed: `pip install deepspeed>=0.11.0 accelerate>=0.25.0`
+   - 系统将自动使用所有可用的GPU
+
+4. **配置DeepSpeed**:
+   - 可以通过修改`ds_config.json`文件来自定义DeepSpeed配置
+   - 适用于有特殊需求的高级用户
+
+5. **注意事项**:
+   - 多GPU模式需要所有GPU型号相似以获得最佳性能
+   - 如遇性能问题，可以尝试关闭DeepSpeed，方法是修改`lib/models.py`中的`"use_deepspeed": False`

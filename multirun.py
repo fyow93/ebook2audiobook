@@ -86,16 +86,16 @@ def run_worker(rank, world_size, args, gpu_ids):
     if ('--tts_engine' not in cmd_args or ('--tts_engine' in cmd_args and cmd_args[cmd_args.index('--tts_engine') + 1] == 'xtts')) and '--deepspeed_config' not in cmd_args:
         # ====================================================
         # A100 GPU优化说明:
-        # 1. 大幅提高batch_size以充分利用40GB显存
-        # 2. 使用ZeRO-3优化内存使用
-        # 3. 优化bucket_size和其他参数提高GPU利用率
-        # 4. 添加gradient_accumulation提高稳定性
+        # 1. 超大batch_size(256)以充分利用40GB显存
+        # 2. 降级到ZeRO-2提高速度，减少参数卸载
+        # 3. 增加每GPU微批次大小到32
+        # 4. 添加激活检查点优化内存使用
         # ====================================================
         
         # 为DeepSpeed创建临时配置文件，与主配置保持一致
         ds_config = {
-            "train_batch_size": 128,                  # 训练批次大小，大幅提高以利用A100显存
-            "gradient_accumulation_steps": 2,        # 梯度累积步数，可以提高稳定性和利用率
+            "train_batch_size": 256,                 # 训练批次大小，超大批次充分利用A100显存
+            "gradient_accumulation_steps": 1,        # 减少梯度累积提高并行度
             "optimizer": {                           # 优化器配置
                 "type": "Adam",                      # 使用Adam优化器
                 "params": {
@@ -114,28 +114,30 @@ def run_worker(rank, world_size, args, gpu_ids):
                 "min_loss_scale": 1
             },
             "zero_optimization": {                   # ZeRO内存优化
-                "stage": 3,                          # Stage 3：分割优化器状态、梯度和模型参数
+                "stage": 2,                          # 降级到Stage 2提高速度
                 "offload_optimizer": {               # 优化器状态卸载配置
                     "device": "cpu",                 # 卸载到CPU
                     "pin_memory": True               # 使用固定内存提高传输效率
                 },
-                "offload_param": {                   # 模型参数卸载配置
-                    "device": "cpu",                 # 卸载到CPU
-                    "pin_memory": True               # 使用固定内存提高传输效率
+                "offload_param": {                   # 参数卸载配置
+                    "device": "none"                 # 不卸载参数到CPU以提高速度
                 },
                 "allgather_partitions": True,        # 在前向/反向传播前收集所有分区
-                "allgather_bucket_size": 2e8,        # allgather操作的通信桶大小
+                "allgather_bucket_size": 5e8,        # allgather操作的通信桶大小
                 "overlap_comm": True,                # 重叠通信和计算以提高效率
                 "reduce_scatter": True,              # 使用reduce-scatter而不是reduce+scatter
-                "reduce_bucket_size": 2e8,           # reduce操作的通信桶大小
-                "contiguous_gradients": True,        # 使用连续的内存缓冲区存储梯度
-                "stage3_prefetch_bucket_size": 2e8,  # Stage 3参数预取桶大小
-                "stage3_param_persistence_threshold": 1e5  # 小于此值的参数将保留在GPU上
+                "reduce_bucket_size": 5e8,           # reduce操作的通信桶大小
+                "contiguous_gradients": True         # 使用连续的内存缓冲区存储梯度
             },
             "gradient_clipping": 1.0,                # 梯度裁剪阈值，防止梯度爆炸
-            "steps_per_print": 50,                   # 打印训练信息的步数间隔
-            "train_micro_batch_size_per_gpu": 16,    # 每个GPU的微批次大小
+            "steps_per_print": 10,                   # 打印训练信息的步数间隔
+            "train_micro_batch_size_per_gpu": 32,    # 每个GPU的微批次大小，增大以提高利用率
             "wall_clock_breakdown": False,           # 关闭墙钟时间细分
+            "activation_checkpointing": {            # 激活检查点优化内存
+                "partition_activations": True,       # 分区激活以减少内存使用
+                "cpu_checkpointing": False,          # 不使用CPU检查点以提高速度
+                "contiguous_memory_optimization": True  # 使用连续内存优化
+            },
             "communication_data_type": "fp16"        # 通信数据类型，使用FP16减少通信量
         }
         

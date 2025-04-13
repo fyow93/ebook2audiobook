@@ -78,10 +78,12 @@ def run_worker(rank, world_size, args, gpu_ids, procs_per_gpu):
         print(f"进程 {rank} 无法初始化分布式环境，退出")
         return
     
-    # 计算当前进程应该使用的GPU ID - 确保不超出实际GPU数量
+    # 修复GPU分配逻辑，确保均衡分配
     num_gpus = len(gpu_ids)
+    # 使用简单的轮询方式分配GPU
     gpu_id = gpu_ids[rank % num_gpus]
-    proc_id_on_gpu = rank // num_gpus if (rank // num_gpus) < procs_per_gpu else rank % procs_per_gpu
+    # 计算当前进程是该GPU上的第几个进程
+    proc_id_on_gpu = rank // num_gpus
     
     print(f"工作进程 {rank} 使用 GPU ID: {gpu_id} (GPU {gpu_id} 上的第{proc_id_on_gpu + 1}个进程，共{procs_per_gpu}个)")
     

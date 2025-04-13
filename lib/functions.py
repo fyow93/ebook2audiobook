@@ -1003,7 +1003,7 @@ def convert_chapters_to_audio(session):
                     print(f"[进程 {info['rank']}] 当前处理章节: {info['current_chapter']} (范围: {info['chapter_range']}), 进度: {info['processed']}/{info['total']} 句")
         
         # 设置是否打印详细日志的标志
-        verbose_logging = session.get('verbose_logging', False)
+        verbose_logging = session.get('verbose_logging', True)
         
         # 禁用tqdm进度条输出，避免过多的"处理中: x/y"日志
         with tqdm(total=total_sentences, desc='处理中', bar_format='{desc}: {n_fmt}/{total_fmt}', unit='step', initial=resume_sentence, disable=True) as t:

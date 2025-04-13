@@ -82,17 +82,50 @@ def run_worker(rank, world_size, args, gpu_ids):
     if '--headless' not in cmd_args:
         cmd_args.append('--headless')
         
-    # 如果有需要，可以添加DeepSpeed特定的参数
-    if '--tts_engine' not in cmd_args or ('--tts_engine' in cmd_args and cmd_args[cmd_args.index('--tts_engine') + 1] == 'xtts'):
-        # 为DeepSpeed创建临时配置文件
+    # 如果有需要，可以添加DeepSpeed特定的参数，但仅当未指定deepspeed_config时
+    if ('--tts_engine' not in cmd_args or ('--tts_engine' in cmd_args and cmd_args[cmd_args.index('--tts_engine') + 1] == 'xtts')) and '--deepspeed_config' not in cmd_args:
+        # ====================================================
+        # A100 GPU优化说明:
+        # 1. 采用与主配置文件一致的设置
+        # 2. 使用ZeRO-3优化内存使用
+        # 3. 为A100配置适当的批处理大小和参数设置
+        # ====================================================
+        
+        # 为DeepSpeed创建临时配置文件，与主配置保持一致
         ds_config = {
-            "train_batch_size": 1,
-            "fp16": {"enabled": True},
-            "zero_optimization": {
-                "stage": 2,
-                "offload_optimizer": {"device": "cpu"}
+            "train_batch_size": 32,                  # 训练批次大小，A100有足够显存支持更大批次
+            "gradient_accumulation_steps": 1,        # 梯度累积步数，可以模拟更大的批次大小
+            "optimizer": {                           # 优化器配置
+                "type": "Adam",                      # 使用Adam优化器
+                "params": {
+                    "lr": 0.0001                     # 学习率设置
+                }
             },
-            "gradient_accumulation_steps": 1
+            "fp16": {                                # 半精度浮点数训练
+                "enabled": True                      # 启用FP16，可减少内存使用并加速训练
+            },
+            "zero_optimization": {                   # ZeRO内存优化
+                "stage": 3,                          # Stage 3：分割优化器状态、梯度和模型参数
+                "offload_optimizer": {               # 优化器状态卸载配置
+                    "device": "cpu",                 # 卸载到CPU
+                    "pin_memory": True               # 使用固定内存提高传输效率
+                },
+                "offload_param": {                   # 模型参数卸载配置
+                    "device": "cpu",                 # 卸载到CPU
+                    "pin_memory": True               # 使用固定内存提高传输效率
+                },
+                "allgather_partitions": True,        # 在前向/反向传播前收集所有分区
+                "allgather_bucket_size": 5e8,        # allgather操作的通信桶大小
+                "overlap_comm": True,                # 重叠通信和计算以提高效率
+                "reduce_scatter": True,              # 使用reduce-scatter而不是reduce+scatter
+                "reduce_bucket_size": 5e8,           # reduce操作的通信桶大小
+                "contiguous_gradients": True,        # 使用连续的内存缓冲区存储梯度
+                "stage3_prefetch_bucket_size": 5e8,  # Stage 3参数预取桶大小
+                "stage3_param_persistence_threshold": 1e6  # 小于此值的参数将保留在GPU上
+            },
+            "gradient_clipping": 1.0,                # 梯度裁剪阈值，防止梯度爆炸
+            "steps_per_print": 50,                   # 打印训练信息的步数间隔
+            "communication_data_type": "fp16"        # 通信数据类型，使用FP16减少通信量
         }
         
         import json
@@ -133,10 +166,11 @@ def run_worker(rank, world_size, args, gpu_ids):
         # 清理分布式环境
         cleanup_distributed()
         
-        # 清理临时文件
-        if '--tts_engine' in cmd_args and cmd_args[cmd_args.index('--tts_engine') + 1] == 'xtts':
-            if os.path.exists(temp_ds_config):
+        # 清理临时文件，只清理我们创建的临时配置文件
+        if ('--tts_engine' in cmd_args and cmd_args[cmd_args.index('--tts_engine') + 1] == 'xtts') and '--deepspeed_config' not in args:
+            if 'temp_ds_config' in locals() and os.path.exists(temp_ds_config):
                 os.remove(temp_ds_config)
+                print(f"已删除临时配置文件: {temp_ds_config}")
 
 def cleanup_temp_files():
     """清理遗留的临时文件"""

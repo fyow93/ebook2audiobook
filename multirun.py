@@ -333,17 +333,14 @@ def collect_and_display_progress(world_size):
                 # 打印总进度
                 print(f"\n总进度: {percentage:.2f}% [{total_processed}/{total_sentences}] 速度: {sentences_per_second:.2f}句/秒 ETA: {eta_str}")
                 
-                # 打印表头
-                print(f"{'进程':<6}| {'章节范围':<18}| {'当前章节':<10}| {'进度'}")
-                print(f"{'-'*6}-+-{'-'*18}-+-{'-'*10}-+-{'-'*15}")
-                
                 # 打印每个进程的进度
                 for p in all_progress:
                     rank = p["rank"]
                     chapter_range = p["chapter_range"]
                     current_chapter = p["current_chapter"]
                     proc_sentences = p["processed_sentences"]
-                    print(f" {rank:<5}| {chapter_range:<18}| 章节 {current_chapter:<5}| {proc_sentences}/{total_sentences} 句")
+                    proc_percentage = (proc_sentences / total_sentences) * 100 if total_sentences > 0 else 0
+                    print(f"[进程 {rank}] 当前处理章节: {current_chapter} (范围: {chapter_range}), 进度: {proc_sentences}/{total_sentences} 句 ({proc_percentage:.2f}%)")
                 
                 print("")  # 空行分隔
     except Exception as e:

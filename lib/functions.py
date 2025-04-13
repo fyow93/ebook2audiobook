@@ -639,7 +639,6 @@ def get_sentences(text, lang):
             else:
                 # 其他情况，尝试转换为字符串
                 text_str = str(text)
-            print(f"警告: 转换非字符串类型 {type(text)} 为字符串进行处理")
         else:
             text_str = text
 
@@ -849,7 +848,6 @@ def convert_chapters_to_audio(session):
                             chapter_content['text'] = ' '.join(str(item) for item in chapter_content['text'])
                         else:
                             chapter_content['text'] = str(chapter_content['text'])
-                        print(f"警告: 章节{chapter_content['index']}文本类型异常({type(chapter_content['text'])}),已转换为字符串")
                     formatted_chapters.append(chapter_content)
                 else:
                     # 如果是纯文本，转换为字典格式
@@ -859,7 +857,6 @@ def convert_chapters_to_audio(session):
                             text_content = ' '.join(str(item) for item in text_content)
                         else:
                             text_content = str(text_content)
-                        print(f"警告: 章节{idx+1}文本类型异常({type(chapter_content)}),已转换为字符串")
                     formatted_chapters.append({
                         'index': idx + 1,
                         'text': text_content
@@ -926,16 +923,28 @@ def convert_chapters_to_audio(session):
             end_chapter = start_chapter + chunks_per_process + (1 if process_rank < remainder else 0)
             
             # 日志输出分片信息
-            print(f"进程 {process_rank}/{total_processes} 将处理章节 {start_chapter+1} 到 {end_chapter} (共{total_chapters}章)")
+            print(f"进程 {process_rank+1}/{total_processes} 将处理章节 {start_chapter+1} 到 {end_chapter} (共{total_chapters}章)")
+            
+            # 计算当前进程需要处理的总句子数
+            process_total_sentences = 0
+            for i, chapter in enumerate(session['chapters']):
+                if start_chapter <= i < end_chapter:
+                    process_total_sentences += len(get_sentences(chapter['text'], session['language']))
+            
+            print(f"进程 {process_rank+1} 共需处理 {process_total_sentences} 个句子")
             
             # 只处理分配给当前进程的章节
             chapters_to_process = session['chapters'][start_chapter:end_chapter]
         else:
             # 单进程模式，处理所有章节
             chapters_to_process = session['chapters']
+            print(f"单进程模式：共处理 {len(session['chapters'])} 章，{total_sentences} 个句子")
         
         # 开始处理章节
         sentence_number = 1
+        processed_sentences = 0
+        start_time = time.time()
+        
         with tqdm(total=total_sentences, desc='Converting 0.00%', bar_format='{desc}: {n_fmt}/{total_fmt} ', unit='step', initial=resume_sentence) as t:
             for chapter in chapters_to_process:
                 if session['cancellation_requested']:
@@ -996,7 +1005,11 @@ def convert_chapters_to_audio(session):
                     
                 # 处理需要转换的章节
                 sentences = get_sentences(chapter['text'], session['language'])
-                print(f'Processing block {chapter_num} containing {len(sentences)} sentences...')
+                chapter_title = ""
+                if 'title' in chapter:
+                    chapter_title = f" '{chapter['title']}'"
+                
+                print(f'\n===== 开始处理章节 {chapter_num}/{len(session["chapters"])}{chapter_title} ({len(sentences)}句) =====')
                 
                 # 记录句子起始索引
                 start = sentence_number
@@ -1027,6 +1040,24 @@ def convert_chapters_to_audio(session):
                             if tts_manager.params['sentence'] != "":
                                 if tts_manager.convert_sentence_to_audio():                           
                                     percentage = (sentence_number / total_sentences) * 100
+                                    
+                                    # 更新进度信息并计算预计完成时间
+                                    processed_sentences += 1
+                                    elapsed_time = time.time() - start_time
+                                    if processed_sentences > 0 and elapsed_time > 0:
+                                        sentences_per_second = processed_sentences / elapsed_time
+                                        remaining_sentences = total_sentences - sentence_number
+                                        if sentences_per_second > 0:
+                                            estimated_time = remaining_sentences / sentences_per_second
+                                            hours, remainder = divmod(estimated_time, 3600)
+                                            minutes, seconds = divmod(remainder, 60)
+                                            eta_str = f"ETA: {int(hours)}h {int(minutes)}m {int(seconds)}s"
+                                            speed_str = f"速度: {sentences_per_second:.2f}句/秒"
+                                            
+                                            # 定期输出总体进度日志
+                                            if processed_sentences % 10 == 0:
+                                                print(f"\n总进度: {percentage:.2f}% [{sentence_number}/{total_sentences}] {speed_str} {eta_str}")
+                                    
                                     t.set_description(f'Converting {percentage:.2f}%: : {i+1}/{len(sentences)}')
                                     msg = f'\nSentence: {sentence}'
                                     print(msg)
@@ -1051,6 +1082,15 @@ def convert_chapters_to_audio(session):
                     if chapter_num <= resume_chapter:
                         msg = f'**Recovering missing file block {chapter_num}'
                         print(msg)
+                    
+                    # 合并前显示章节处理统计
+                    chapter_elapsed_time = time.time() - start_time
+                    chapter_sentences = end - start + 1
+                    if chapter_elapsed_time > 0 and chapter_sentences > 0:
+                        chapter_speed = chapter_sentences / chapter_elapsed_time
+                        print(f"章节 {chapter_num} 已完成: 处理 {chapter_sentences} 句，耗时 {chapter_elapsed_time:.2f}秒，速度 {chapter_speed:.2f}句/秒")
+                    
+                    # 执行合并
                     if combine_audio_sentences(chapter_audio_file, start, end, session):
                         msg = f'Combining block {chapter_num} to audio, sentence {start} to {end}'
                         print(msg)
@@ -1059,6 +1099,16 @@ def convert_chapters_to_audio(session):
                         print(msg)
                         return False
                         
+        # 显示总体完成统计
+        total_elapsed_time = time.time() - start_time
+        if total_elapsed_time > 0 and processed_sentences > 0:
+            total_speed = processed_sentences / total_elapsed_time
+            hours, remainder = divmod(total_elapsed_time, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            print(f"\n===== 转换任务完成 =====")
+            print(f"总计处理 {processed_sentences} 句，耗时 {int(hours)}小时{int(minutes)}分{int(seconds)}秒")
+            print(f"平均速度: {total_speed:.2f}句/秒")
+        
         return True
     except Exception as e:
         DependencyError(e)

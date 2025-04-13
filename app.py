@@ -7,6 +7,8 @@ import socket
 import subprocess
 import sys
 import torch
+import json
+import pprint
 
 from pathlib import Path
 
@@ -290,14 +292,18 @@ Linux/Mac:
                             # 如果提供了配置文件路径，则读取配置
                             if 'deepspeed_config' in args and args['deepspeed_config']:
                                 if os.path.exists(args['deepspeed_config']):
-                                    import json
-                                    import shutil
-                                    
                                     # 如果指定的不是ds_config.json，则复制到ds_config.json
                                     if os.path.basename(args['deepspeed_config']) != "ds_config.json":
                                         # 复制配置文件到项目根目录的ds_config.json
                                         print(f"将配置文件 {args['deepspeed_config']} 复制到 ds_config.json")
                                         shutil.copy2(args['deepspeed_config'], "ds_config.json")
+                                    
+                                    # 读取并打印配置内容
+                                    with open("ds_config.json", "r") as f:
+                                        config_content = json.load(f)
+                                        print("\n================ app.py中读取的DeepSpeed配置 ================")
+                                        pprint.pprint(config_content)
+                                        print("=============================================================\n")
                                     
                                     print(f"DeepSpeed将使用配置文件: ds_config.json")
                             

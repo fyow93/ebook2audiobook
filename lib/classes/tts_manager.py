@@ -118,6 +118,12 @@ def load_coqui_tts_checkpoint(model_path, config_path, vocab_path, device):
                         print(f"训练批次大小: {ds_config['train_batch_size']}")
                     if 'train_micro_batch_size_per_gpu' in ds_config:
                         print(f"每GPU微批次大小: {ds_config['train_micro_batch_size_per_gpu']}")
+                    
+                    # 打印完整的DeepSpeed配置
+                    print("\n=================== DeepSpeed配置详情 ===================")
+                    import pprint
+                    pprint.pprint(ds_config)
+                    print("==========================================================\n")
                 else:
                     print(f"警告: 未找到DeepSpeed配置文件 {config_path}")
                     print("DeepSpeed将使用默认配置运行，可能无法充分利用GPU资源")
@@ -134,6 +140,16 @@ def load_coqui_tts_checkpoint(model_path, config_path, vocab_path, device):
         
         # 初始化TTS模型
         tts = Xtts.init_from_config(config)
+        
+        # 在加载checkpoint前再次打印DeepSpeed配置
+        print("\n=================== 最终使用的DeepSpeed配置 ===================")
+        print(f"use_deepspeed: {default_xtts_settings['use_deepspeed'] and num_gpus > 1}")
+        if ds_config:
+            import pprint
+            pprint.pprint(ds_config)
+        else:
+            print("警告: 未配置DeepSpeed参数，将使用默认设置")
+        print("=============================================================\n")
         
         with lock:
             tts.load_checkpoint(

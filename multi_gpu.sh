@@ -20,6 +20,12 @@ for arg in "$@"; do
     fi
 done
 
+# 验证每GPU进程数不超过8
+if [ $PROCS_PER_GPU -gt 8 ]; then
+    echo "警告: 每GPU进程数过高 ($PROCS_PER_GPU)，已限制为8"
+    PROCS_PER_GPU=8
+fi
+
 echo "每个GPU的进程数: $PROCS_PER_GPU"
 echo "工作负载均衡: $BALANCE_WORKLOAD"
 echo "应用参数: ${APP_ARGS[@]}"
@@ -30,6 +36,11 @@ echo "检测到 $GPU_COUNT 个可用GPU"
 
 # 计算总进程数
 TOTAL_PROCS=$((GPU_COUNT * PROCS_PER_GPU))
+# 限制总进程数不超过32
+if [ $TOTAL_PROCS -gt 32 ]; then
+    echo "警告: 总进程数过高 ($TOTAL_PROCS)，已限制为32"
+    TOTAL_PROCS=32
+fi
 echo "将启动总共 $TOTAL_PROCS 个进程"
 
 if [ $GPU_COUNT -le 1 ]; then
@@ -63,7 +74,7 @@ echo "设置CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 if [ ${#APP_ARGS[@]} -eq 0 ]; then
     echo "使用方法: ./multi_gpu.sh [--procs_per_gpu=N] [--balance_workload=0|1] [app.py参数]"
     echo "选项:"
-    echo "  --procs_per_gpu=N     设置每个GPU运行的进程数，默认为4"
+    echo "  --procs_per_gpu=N     设置每个GPU运行的进程数，默认为4，最大为8"
     echo "  --balance_workload=N  是否开启工作负载均衡(0=关闭,1=开启)，默认1"
     echo "例如:"
     echo "  ./multi_gpu.sh --procs_per_gpu=2 --balance_workload=1 --headless --ebook path/to/book.epub"
@@ -73,7 +84,7 @@ fi
 
 # 检查是否安装了必要的包
 echo "安装必要的依赖包..."
-#pip install torch deepspeed accelerate
+pip install torch==2.1.0 deepspeed==0.12.5 accelerate==0.25.0 >/dev/null 2>&1
 
 # 清理之前的进程组，避免干扰
 if [ -d "/tmp/torch_distributed" ]; then

@@ -18,6 +18,12 @@ from pathlib import Path
 import tempfile
 import shutil
 import re
+import json
+import datetime
+
+# 进度收集相关的常量
+PROGRESS_DIR = os.path.join(tempfile.gettempdir(), "ebook2audiobook_progress")
+PROGRESS_UPDATE_INTERVAL = 10  # 10秒更新一次总进度
 
 def get_num_gpus():
     """获取可用的GPU数量"""
@@ -53,6 +59,15 @@ def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
         print("已销毁分布式进程组")
+
+def cleanup_progress_files():
+    """清理进度文件"""
+    if os.path.exists(PROGRESS_DIR):
+        try:
+            shutil.rmtree(PROGRESS_DIR)
+            print(f"已清理进度文件目录: {PROGRESS_DIR}")
+        except Exception as e:
+            print(f"清理进度文件目录失败: {e}")
 
 def run_worker(rank, world_size, args, gpu_ids, procs_per_gpu):
     """每个工作进程的执行函数"""
@@ -104,6 +119,17 @@ def run_worker(rank, world_size, args, gpu_ids, procs_per_gpu):
     full_cmd = [sys.executable, 'app.py'] + cmd_args
     print(f"进程 {rank} 执行命令: {' '.join(full_cmd)}")
     
+    # 为进程0创建进度收集目录
+    if rank == 0:
+        os.makedirs(PROGRESS_DIR, exist_ok=True)
+        print(f"进程0已创建进度收集目录: {PROGRESS_DIR}")
+        # 清理可能存在的旧进度文件
+        for old_file in glob.glob(os.path.join(PROGRESS_DIR, "progress_*.json")):
+            try:
+                os.remove(old_file)
+            except:
+                pass
+    
     try:
         # 执行命令
         process = subprocess.Popen(
@@ -113,6 +139,19 @@ def run_worker(rank, world_size, args, gpu_ids, procs_per_gpu):
             universal_newlines=True,
             bufsize=1
         )
+        
+        # 进度信息
+        progress_info = {
+            "rank": rank,
+            "current_chapter": 0,
+            "chapter_range": "",
+            "processed_sentences": 0,
+            "total_sentences": 0,
+            "last_update": time.time()
+        }
+        
+        last_progress_write = 0
+        last_progress_display = 0
         
         # 实时输出进程日志
         last_lines = {}  # 为每个进度类型记录最后一行日志，用于去重
@@ -143,9 +182,17 @@ def run_worker(rank, world_size, args, gpu_ids, procs_per_gpu):
             if "Converting" in line_content:
                 # 提取进度百分比和数字作为键
                 progress_key = ""
-                match = re.search(r'Converting ([\d.]+)%: : (\d+)', line_content)
+                match = re.search(r'Converting ([\d.]+)%: : (\d+)/(\d+)', line_content)
                 if match:
                     progress_key = f"Converting_{match.group(1)}_{match.group(2)}"
+                    
+                    # 捕获转换总数和当前进度
+                    processed = int(match.group(2))
+                    total = int(match.group(3))
+                    
+                    # 更新进度信息
+                    progress_info["processed_sentences"] = processed
+                    progress_info["total_sentences"] = total
                     
                     # 检查是否是重复的转换进度
                     if progress_key in last_lines:
@@ -158,6 +205,41 @@ def run_worker(rank, world_size, args, gpu_ids, procs_per_gpu):
                             keys_to_remove = list(last_lines.keys())[:-500]
                             for key in keys_to_remove:
                                 last_lines.pop(key, None)
+            
+            # 捕获章节范围和当前章节信息
+            chapter_range_match = re.search(r'进程 \d+/\d+ 将处理章节 (\d+) 到 (\d+) \(共(\d+)章\)', line_content)
+            if chapter_range_match:
+                start_chapter = chapter_range_match.group(1)
+                end_chapter = chapter_range_match.group(2)
+                total_chapters = chapter_range_match.group(3)
+                progress_info["chapter_range"] = f"{start_chapter}-{end_chapter}/{total_chapters}"
+            
+            current_chapter_match = re.search(r'处理章节 (\d+)', line_content)
+            if current_chapter_match:
+                progress_info["current_chapter"] = int(current_chapter_match.group(1))
+            
+            # 更新和写入进度信息
+            current_time = time.time()
+            if current_time - last_progress_write >= 2:  # 每2秒写入一次进度
+                progress_info["last_update"] = current_time
+                progress_file = os.path.join(PROGRESS_DIR, f"progress_{rank}.json")
+                
+                # 安全写入进度文件
+                try:
+                    temp_file = f"{progress_file}.tmp"
+                    with open(temp_file, 'w') as f:
+                        json.dump(progress_info, f)
+                    # 原子重命名，确保文件写入完整
+                    os.replace(temp_file, progress_file)
+                except Exception as e:
+                    print(f"写入进度文件失败: {e}")
+                
+                last_progress_write = current_time
+            
+            # 进程0负责汇总并显示所有进程的进度
+            if rank == 0 and current_time - last_progress_display >= PROGRESS_UPDATE_INTERVAL:
+                collect_and_display_progress(world_size)
+                last_progress_display = current_time
             
             # 只输出应该记录的日志
             if should_log:
@@ -180,6 +262,87 @@ def run_worker(rank, world_size, args, gpu_ids, procs_per_gpu):
                 print(f"已删除临时配置文件: {temp_ds_config}")
             except Exception as e:
                 print(f"无法删除临时文件 {temp_ds_config}: {e}")
+        
+        # 删除自己的进度文件
+        progress_file = os.path.join(PROGRESS_DIR, f"progress_{rank}.json")
+        if os.path.exists(progress_file):
+            try:
+                os.remove(progress_file)
+            except:
+                pass
+
+def collect_and_display_progress(world_size):
+    """收集并显示所有进程的进度"""
+    if not os.path.exists(PROGRESS_DIR):
+        return
+    
+    try:
+        progress_files = glob.glob(os.path.join(PROGRESS_DIR, "progress_*.json"))
+        if not progress_files:
+            return
+        
+        all_progress = []
+        total_processed = 0
+        total_sentences = 0
+        
+        # 收集所有进程的进度
+        for progress_file in progress_files:
+            try:
+                with open(progress_file, 'r') as f:
+                    progress = json.load(f)
+                    all_progress.append(progress)
+                    total_processed += progress["processed_sentences"]
+                    
+                    # 只从一个进程获取总句子数，因为所有进程看到的总数应该相同
+                    if progress["total_sentences"] > total_sentences:
+                        total_sentences = progress["total_sentences"]
+            except Exception as e:
+                print(f"读取进度文件 {progress_file} 失败: {e}")
+        
+        if not all_progress or total_sentences == 0:
+            return
+        
+        # 按进程编号排序
+        all_progress.sort(key=lambda x: x["rank"])
+        
+        # 计算总体进度
+        percentage = (total_processed / total_sentences) * 100 if total_sentences > 0 else 0
+        
+        # 计算处理速度和预计剩余时间
+        now = time.time()
+        times = [p["last_update"] for p in all_progress]
+        if times:
+            oldest_update = min(times)
+            elapsed_seconds = now - oldest_update
+            if elapsed_seconds > 0:
+                sentences_per_second = total_processed / elapsed_seconds
+                remaining_sentences = total_sentences - total_processed
+                eta_seconds = remaining_sentences / sentences_per_second if sentences_per_second > 0 else 0
+                
+                # 格式化ETA为小时:分钟:秒
+                eta_hours = int(eta_seconds // 3600)
+                eta_minutes = int((eta_seconds % 3600) // 60)
+                eta_seconds = int(eta_seconds % 60)
+                eta_str = f"{eta_hours}h {eta_minutes}m {eta_seconds}s"
+                
+                # 打印总进度
+                print(f"\n总进度: {percentage:.2f}% [{total_processed}/{total_sentences}] 速度: {sentences_per_second:.2f}句/秒 ETA: {eta_str}")
+                
+                # 打印表头
+                print(f"{'进程':<6}| {'章节范围':<18}| {'当前章节':<10}| {'进度'}")
+                print(f"{'-'*6}-+-{'-'*18}-+-{'-'*10}-+-{'-'*15}")
+                
+                # 打印每个进程的进度
+                for p in all_progress:
+                    rank = p["rank"]
+                    chapter_range = p["chapter_range"]
+                    current_chapter = p["current_chapter"]
+                    proc_sentences = p["processed_sentences"]
+                    print(f" {rank:<5}| {chapter_range:<18}| 章节 {current_chapter:<5}| {proc_sentences}/{total_sentences} 句")
+                
+                print("")  # 空行分隔
+    except Exception as e:
+        print(f"收集和显示进度时发生错误: {e}")
 
 def cleanup_temp_files():
     """清理遗留的临时文件"""
@@ -193,6 +356,9 @@ def cleanup_temp_files():
                 print(f"已删除临时文件: {file_path}")
             except Exception as e:
                 print(f"无法删除临时文件 {file_path}: {e}")
+    
+    # 同时清理进度文件
+    cleanup_progress_files()
 
 def signal_handler(sig, frame):
     """处理终止信号"""
@@ -228,9 +394,15 @@ def main():
                         help='是否启用工作负载均衡（0=关闭，1=启用，默认1）')
     parser.add_argument('--output_dir', type=str, default="output",
                         help='输出文件的汇总目录（默认为当前目录下的output）')
+    parser.add_argument('--progress_interval', type=int, default=10,
+                        help='进度更新间隔（秒，默认10秒）')
     
     # 解析我们自己的参数
     my_args, app_args = parser.parse_known_args()
+    
+    # 设置进度更新间隔
+    global PROGRESS_UPDATE_INTERVAL
+    PROGRESS_UPDATE_INTERVAL = my_args.progress_interval
     
     # 计算每个GPU的进程数
     procs_per_gpu = min(my_args.procs_per_gpu, 8)  # 限制每GPU最多8个进程，防止资源耗尽

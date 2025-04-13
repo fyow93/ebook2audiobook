@@ -809,7 +809,7 @@ def convert_chapters_to_audio(session):
         if not os.path.exists(session['chapters_dir_sentences']):
             os.makedirs(session['chapters_dir_sentences'], exist_ok=True)
         # set TTS engine
-        tts_manager = TTS(session)
+        tts_manager = TTSManager(session, is_gui_process)
         total_sentences = 0
         # Calculate total sentences
         for chapter in session['chapters']:

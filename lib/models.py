@@ -41,12 +41,41 @@ default_xtts_settings = {
     "world_size": 1,
     # Default DeepSpeed configuration
     "deepspeed_config": {
-        "train_batch_size": 1,
-        "fp16": {"enabled": True},
+        "train_batch_size": 256,
+        "train_micro_batch_size_per_gpu": 32,
+        "fp16": {
+            "enabled": True,
+            "loss_scale": 0,
+            "loss_scale_window": 1000,
+            "initial_scale_power": 16,
+            "hysteresis": 2,
+            "min_loss_scale": 1
+        },
         "zero_optimization": {
             "stage": 2,
-            "offload_optimizer": {"device": "cpu"}
+            "offload_optimizer": {
+                "device": "cpu",
+                "pin_memory": True
+            },
+            "offload_param": {
+                "device": "none"
+            },
+            "allgather_partitions": True,
+            "allgather_bucket_size": 5e8,
+            "overlap_comm": True,
+            "reduce_scatter": True,
+            "reduce_bucket_size": 5e8,
+            "contiguous_gradients": True
         },
+        "gradient_clipping": 1.0,
+        "steps_per_print": 10,
+        "wall_clock_breakdown": False,
+        "activation_checkpointing": {
+            "partition_activations": True,
+            "cpu_checkpointing": False,
+            "contiguous_memory_optimization": True
+        },
+        "communication_data_type": "fp16",
         "gradient_accumulation_steps": 1
     },
     "files": ['config.json', 'model.pth', 'vocab.json', 'ref.wav'],

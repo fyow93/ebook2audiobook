@@ -811,6 +811,22 @@ def convert_chapters_to_audio(session):
         # set TTS engine
         tts_manager = TTSManager(session, is_gui_process)
         total_sentences = 0
+        
+        # 处理chapters数据结构，确保是有效格式
+        formatted_chapters = []
+        if session['chapters'] is not None:
+            for idx, chapter_content in enumerate(session['chapters']):
+                # 检查chapter是否已经是字典格式
+                if isinstance(chapter_content, dict) and 'text' in chapter_content and 'index' in chapter_content:
+                    formatted_chapters.append(chapter_content)
+                else:
+                    # 如果是纯文本，转换为字典格式
+                    formatted_chapters.append({
+                        'index': idx + 1,
+                        'text': chapter_content
+                    })
+        session['chapters'] = formatted_chapters
+        
         # Calculate total sentences
         for chapter in session['chapters']:
             chapter_text = chapter['text']

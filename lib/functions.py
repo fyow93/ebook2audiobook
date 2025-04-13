@@ -944,8 +944,24 @@ def convert_chapters_to_audio(session):
         sentence_number = 1
         processed_sentences = 0
         start_time = time.time()
+        last_progress_time = start_time
         
-        with tqdm(total=total_sentences, desc='Converting 0.00%', bar_format='{desc}: {n_fmt}/{total_fmt} ', unit='step', initial=resume_sentence) as t:
+        # 添加全局进度收集变量
+        if not hasattr(convert_chapters_to_audio, 'global_progress'):
+            convert_chapters_to_audio.global_progress = {}
+        
+        # 记录当前进程进度
+        convert_chapters_to_audio.global_progress[process_rank] = {
+            'rank': process_rank + 1,
+            'total_procs': total_processes,
+            'processed': 0,
+            'total': len(get_sentences(''.join([ch['text'] for ch in chapters_to_process]), session['language'])),
+            'current_chapter': chapters_to_process[0]['index'] if chapters_to_process else 0,
+            'chapter_range': f"{chapters_to_process[0]['index']} 到 {chapters_to_process[-1]['index']}" if chapters_to_process else "无",
+            'last_update': time.time()
+        }
+        
+        with tqdm(total=total_sentences, desc='处理中', bar_format='{desc}: {n_fmt}/{total_fmt}', unit='step', initial=resume_sentence) as t:
             for chapter in chapters_to_process:
                 if session['cancellation_requested']:
                     return False
@@ -1005,14 +1021,24 @@ def convert_chapters_to_audio(session):
                     
                 # 处理需要转换的章节
                 sentences = get_sentences(chapter['text'], session['language'])
+                
+                # 更新进程状态
+                convert_chapters_to_audio.global_progress[process_rank]['current_chapter'] = chapter_num
+                
+                # 章节标题（仅用于调试）
                 chapter_title = ""
                 if 'title' in chapter:
                     chapter_title = f" '{chapter['title']}'"
                 
-                print(f'\n===== 开始处理章节 {chapter_num}/{len(session["chapters"])}{chapter_title} ({len(sentences)}句) =====')
+                # 仅在开始新章节时显示简短信息
+                if processed_sentences == 0 or (chapter_num > 1 and chapter_num != convert_chapters_to_audio.global_progress[process_rank].get('last_chapter', 0)):
+                    print(f'[进程 {process_rank+1}] 处理章节 {chapter_num}')
+                    convert_chapters_to_audio.global_progress[process_rank]['last_chapter'] = chapter_num
                 
                 # 记录句子起始索引
                 start = sentence_number
+                
+                print(f'\n===== 开始处理章节 {chapter_num}/{len(session["chapters"])}{chapter_title} ({len(sentences)}句) =====')
                 
                 # 处理每个句子
                 for i, sentence in enumerate(sentences):

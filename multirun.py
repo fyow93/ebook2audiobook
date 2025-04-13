@@ -86,23 +86,32 @@ def run_worker(rank, world_size, args, gpu_ids):
     if ('--tts_engine' not in cmd_args or ('--tts_engine' in cmd_args and cmd_args[cmd_args.index('--tts_engine') + 1] == 'xtts')) and '--deepspeed_config' not in cmd_args:
         # ====================================================
         # A100 GPU优化说明:
-        # 1. 采用与主配置文件一致的设置
+        # 1. 大幅提高batch_size以充分利用40GB显存
         # 2. 使用ZeRO-3优化内存使用
-        # 3. 为A100配置适当的批处理大小和参数设置
+        # 3. 优化bucket_size和其他参数提高GPU利用率
+        # 4. 添加gradient_accumulation提高稳定性
         # ====================================================
         
         # 为DeepSpeed创建临时配置文件，与主配置保持一致
         ds_config = {
-            "train_batch_size": 32,                  # 训练批次大小，A100有足够显存支持更大批次
-            "gradient_accumulation_steps": 1,        # 梯度累积步数，可以模拟更大的批次大小
+            "train_batch_size": 128,                  # 训练批次大小，大幅提高以利用A100显存
+            "gradient_accumulation_steps": 2,        # 梯度累积步数，可以提高稳定性和利用率
             "optimizer": {                           # 优化器配置
                 "type": "Adam",                      # 使用Adam优化器
                 "params": {
-                    "lr": 0.0001                     # 学习率设置
+                    "lr": 0.0001,                    # 学习率设置
+                    "betas": [0.9, 0.999],
+                    "eps": 1e-8,
+                    "weight_decay": 0.01
                 }
             },
             "fp16": {                                # 半精度浮点数训练
-                "enabled": True                      # 启用FP16，可减少内存使用并加速训练
+                "enabled": True,                     # 启用FP16，可减少内存使用并加速训练
+                "loss_scale": 0,                     # 动态损失缩放
+                "loss_scale_window": 1000,
+                "initial_scale_power": 16,
+                "hysteresis": 2,
+                "min_loss_scale": 1
             },
             "zero_optimization": {                   # ZeRO内存优化
                 "stage": 3,                          # Stage 3：分割优化器状态、梯度和模型参数
@@ -115,16 +124,18 @@ def run_worker(rank, world_size, args, gpu_ids):
                     "pin_memory": True               # 使用固定内存提高传输效率
                 },
                 "allgather_partitions": True,        # 在前向/反向传播前收集所有分区
-                "allgather_bucket_size": 5e8,        # allgather操作的通信桶大小
+                "allgather_bucket_size": 2e8,        # allgather操作的通信桶大小
                 "overlap_comm": True,                # 重叠通信和计算以提高效率
                 "reduce_scatter": True,              # 使用reduce-scatter而不是reduce+scatter
-                "reduce_bucket_size": 5e8,           # reduce操作的通信桶大小
+                "reduce_bucket_size": 2e8,           # reduce操作的通信桶大小
                 "contiguous_gradients": True,        # 使用连续的内存缓冲区存储梯度
-                "stage3_prefetch_bucket_size": 5e8,  # Stage 3参数预取桶大小
-                "stage3_param_persistence_threshold": 1e6  # 小于此值的参数将保留在GPU上
+                "stage3_prefetch_bucket_size": 2e8,  # Stage 3参数预取桶大小
+                "stage3_param_persistence_threshold": 1e5  # 小于此值的参数将保留在GPU上
             },
             "gradient_clipping": 1.0,                # 梯度裁剪阈值，防止梯度爆炸
             "steps_per_print": 50,                   # 打印训练信息的步数间隔
+            "train_micro_batch_size_per_gpu": 16,    # 每个GPU的微批次大小
+            "wall_clock_breakdown": False,           # 关闭墙钟时间细分
             "communication_data_type": "fp16"        # 通信数据类型，使用FP16减少通信量
         }
         

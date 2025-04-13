@@ -96,6 +96,11 @@ def run_worker(rank, world_size, args, gpu_ids, procs_per_gpu):
         '--use_distributed', 'True'
     ])
     
+    # 添加模型共享参数 - 使用临时目录存储共享模型
+    shared_model_dir = os.path.join(tempfile.gettempdir(), "tts_model_cache")
+    os.makedirs(shared_model_dir, exist_ok=True)
+    # 不再添加命令行参数，因为模型共享现在是默认行为
+    
     # 如果命令行中未指定deepspeed_config，且需要deepspeed支持
     temp_ds_config = None
     if '--deepspeed_config' not in cmd_args:

@@ -323,5 +323,19 @@ Linux/Mac:
                 error = 'Error: In non-headless mode, no option or only --share can be passed'
                 print(error)
                 sys.exit(1)
+
+        # 处理DeepSpeed配置
+        if args.get('deepspeed_config'):
+            try:
+                # 如果指定了配置文件，读取并打印
+                with open(args['deepspeed_config'], 'r') as f:
+                    ds_config = json.load(f)
+                print("\n=================== app.py中读取的DeepSpeed配置 ===================")
+                import pprint
+                pprint.pprint(ds_config)
+                print("==============================================================\n")
+            except Exception as e:
+                print(f"读取DeepSpeed配置文件失败: {e}")
+
 if __name__ == '__main__':
     main()

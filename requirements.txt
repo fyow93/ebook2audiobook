@@ -6,6 +6,7 @@ demucs
 docker
 ebooklib
 fastapi
+filelock
 gensim
 gradio
 hangul-romanize

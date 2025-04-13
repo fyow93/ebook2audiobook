@@ -167,8 +167,27 @@ def run_worker(rank, world_size, args, gpu_ids):
         
         # 实时输出进程日志
         for line in iter(process.stdout.readline, ''):
-            # 过滤掉页面分割日志消息
-            if "Splitting on page-break" not in line and "Split into" not in line:
+            # 过滤掉页面分割和文件解析等冗长日志消息
+            should_log = True
+            
+            # 需要过滤的日志类型
+            skip_patterns = [
+                "Splitting on page-break",  # 页面分割日志
+                "Split into",               # 分割结果日志
+                "Parsing OEBPS/Text",       # XHTML解析日志
+                "pages to extract: [",      # 页面提取信息
+                "Converting page",          # 页面转换信息
+                "Chapter extraction progress:"  # 章节提取进度
+            ]
+            
+            # 检查是否需要跳过此日志
+            for pattern in skip_patterns:
+                if pattern in line:
+                    should_log = False
+                    break
+            
+            # 只输出应该记录的日志
+            if should_log:
                 print(f"[进程 {rank}] {line.strip()}")
         
         # 等待进程完成

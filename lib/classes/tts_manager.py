@@ -73,13 +73,24 @@ def load_coqui_tts_api(model_path, device):
                     else:
                         tts.to(device)
                 
-                # 保存模型以便其他进程使用
-                _save_shared_model(tts, model_key)
-                
-                # 创建模型加载完成标记文件
-                with open(model_ready_file, 'w') as f:
-                    f.write(f"Model API {model_path} loaded successfully at {datetime.datetime.now()}")
-                print(f"模型 {model_key} 加载完成标记已创建 - {datetime.datetime.now()}")
+                # 对于API模型，我们不使用_save_shared_model，直接保存状态
+                try:
+                    # 创建模型文件
+                    model_path_file = os.path.join(TTS_MODEL_CACHE_DIR, f"model_{model_key}.pt")
+                    torch.save(tts.state_dict(), model_path_file)
+                    print(f"API模型已保存到: {model_path_file}")
+                    
+                    # 创建模型加载完成标记文件
+                    with open(model_ready_file, 'w') as f:
+                        f.write(f"Model API {model_path} loaded successfully at {datetime.datetime.now()}")
+                    print(f"模型 {model_key} 加载完成标记已创建 - {datetime.datetime.now()}")
+                except Exception as e:
+                    print(f"保存API模型失败: {e}")
+                    if os.path.exists(model_ready_file):
+                        try:
+                            os.remove(model_ready_file)
+                        except:
+                            pass
                 
                 return tts
             except Exception as e:
@@ -328,6 +339,9 @@ def _save_shared_model(model, model_key):
         model_path = os.path.join(TTS_MODEL_CACHE_DIR, f"model_{model_key}.pt")
         model_config_path = os.path.join(TTS_MODEL_CACHE_DIR, f"model_{model_key}_config.json")
         
+        # 创建就绪标记（提前定义，避免未定义错误）
+        ready_file = MODEL_READY_FILE_TEMPLATE.format(model_key)
+        
         # 不同的保存方式处理
         if isinstance(model, (torch.nn.DataParallel, DDP)):
             # 如果是封装过的模型，获取原始模型
@@ -335,19 +349,44 @@ def _save_shared_model(model, model_key):
             
             # 保存模型配置信息
             if hasattr(model.module, 'config'):
-                with open(model_config_path, 'w') as f:
-                    json.dump(model.module.config.to_dict(), f)
+                try:
+                    with open(model_config_path, 'w') as f:
+                        if hasattr(model.module.config, 'to_dict'):
+                            json.dump(model.module.config.to_dict(), f)
+                        else:
+                            # 处理配置对象没有to_dict方法的情况
+                            config_dict = {}
+                            for key, value in vars(model.module.config).items():
+                                # 跳过不可序列化的属性
+                                if isinstance(value, (str, int, float, bool, list, dict)) or value is None:
+                                    config_dict[key] = value
+                            json.dump(config_dict, f)
+                except Exception as e:
+                    print(f"保存模型配置信息时出错: {e}")
+                    # 出错时不终止整个函数，仍继续保存模型
         else:
             # 直接保存模型状态
             torch.save(model.state_dict(), model_path)
             
             # 保存模型配置信息
             if hasattr(model, 'config'):
-                with open(model_config_path, 'w') as f:
-                    json.dump(model.config.to_dict(), f)
+                try:
+                    with open(model_config_path, 'w') as f:
+                        if hasattr(model.config, 'to_dict'):
+                            json.dump(model.config.to_dict(), f)
+                        else:
+                            # 处理配置对象没有to_dict方法的情况
+                            config_dict = {}
+                            for key, value in vars(model.config).items():
+                                # 跳过不可序列化的属性
+                                if isinstance(value, (str, int, float, bool, list, dict)) or value is None:
+                                    config_dict[key] = value
+                            json.dump(config_dict, f)
+                except Exception as e:
+                    print(f"保存模型配置信息时出错: {e}")
+                    # 出错时不终止整个函数，仍继续保存模型
         
         # 创建就绪标记
-        ready_file = MODEL_READY_FILE_TEMPLATE.format(model_key)
         with open(ready_file, 'w') as f:
             f.write(f"Model ready at {time.ctime()}")
         
@@ -355,7 +394,8 @@ def _save_shared_model(model, model_key):
         return True
     except Exception as e:
         print(f"保存共享模型失败: {e}")
-        if os.path.exists(ready_file):
+        # 确保ready_file已定义
+        if 'ready_file' in locals() and os.path.exists(ready_file):
             try:
                 os.remove(ready_file)
             except:
@@ -378,33 +418,45 @@ def _load_shared_model(model_key, device):
             # 加载API模型
             model_name = model_key[4:]  # 去掉前缀
             tts = TtsXTTS(model_name)
-            # 加载状态字典
-            state_dict = torch.load(model_path, map_location=device)
-            tts.load_state_dict(state_dict)
-        elif model_key.startswith("checkpoint_"):
-            # 加载检查点模型 - 需要先初始化配置
-            if os.path.exists(model_config_path):
-                # 从保存的配置文件加载
-                with open(model_config_path, 'r') as f:
-                    config_dict = json.load(f)
-                
-                # 创建配置对象
-                config = XttsConfig()
-                config.from_dict(config_dict)
-                
-                # 初始化模型
-                tts = Xtts.init_from_config(config)
-                
+            
+            try:
                 # 加载状态字典
                 state_dict = torch.load(model_path, map_location=device)
                 tts.load_state_dict(state_dict)
+                print(f"已成功从共享存储加载API模型: {model_key}")
+            except Exception as e:
+                print(f"加载模型状态失败: {e}，尝试重新加载模型")
+                # 如果状态加载失败，重新初始化模型
+                tts = TtsXTTS(model_name)
+        elif model_key.startswith("checkpoint_"):
+            # 加载检查点模型 - 需要先初始化配置
+            if os.path.exists(model_config_path):
+                try:
+                    # 从保存的配置文件加载
+                    with open(model_config_path, 'r') as f:
+                        config_dict = json.load(f)
+                    
+                    # 创建配置对象
+                    config = XttsConfig()
+                    
+                    # 安全地设置配置属性
+                    for key, value in config_dict.items():
+                        if hasattr(config, key):
+                            setattr(config, key, value)
+                    
+                    # 初始化模型
+                    tts = Xtts.init_from_config(config)
+                    
+                    # 加载状态字典
+                    state_dict = torch.load(model_path, map_location=device)
+                    tts.load_state_dict(state_dict)
+                    print(f"已成功从共享存储加载检查点模型: {model_key}")
+                except Exception as e:
+                    print(f"加载模型配置或状态失败: {e}，尝试重新加载模型")
+                    return None
             else:
-                # 如果没有配置文件，尝试使用原始的加载方式
-                # 这可能会失败，因为我们需要完整的配置信息
-                print(f"警告: 未找到模型配置文件，尝试直接加载")
-                
-                # 这里简化处理，可能需要更复杂的逻辑
-                # 在实际场景中，可能需要保存更多的上下文信息
+                # 如果没有配置文件，无法加载模型
+                print(f"警告: 未找到模型配置文件 {model_config_path}，无法加载模型")
                 return None
         else:
             # 不支持的模型类型

@@ -167,7 +167,9 @@ def run_worker(rank, world_size, args, gpu_ids):
         
         # 实时输出进程日志
         for line in iter(process.stdout.readline, ''):
-            print(f"[进程 {rank}] {line.strip()}")
+            # 过滤掉页面分割日志消息
+            if "Splitting on page-break" not in line and "Split into" not in line:
+                print(f"[进程 {rank}] {line.strip()}")
         
         # 等待进程完成
         return_code = process.wait()

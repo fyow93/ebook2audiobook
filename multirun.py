@@ -62,10 +62,11 @@ def run_worker(rank, world_size, args, gpu_ids, procs_per_gpu):
         return
     
     # 计算当前进程应该使用的GPU ID
-    # 现在一个GPU可能负责多个进程，因此使用整除确定GPU ID
-    gpu_id = gpu_ids[rank // procs_per_gpu] if rank // procs_per_gpu < len(gpu_ids) else rank % len(gpu_ids)
+    # 修改GPU分配逻辑，确保进程均匀分布到所有GPU上
+    gpu_id = gpu_ids[rank % len(gpu_ids)]
+    proc_id_on_gpu = rank // len(gpu_ids)
     
-    print(f"工作进程 {rank} 使用 GPU ID: {gpu_id} (GPU上的第{rank % procs_per_gpu + 1}个进程)")
+    print(f"工作进程 {rank} 使用 GPU ID: {gpu_id} (GPU {gpu_id} 上的第{proc_id_on_gpu + 1}个进程)")
     
     # 设置DeepSpeed相关环境变量
     os.environ['PYTHONPATH'] = os.path.dirname(os.path.abspath(__file__)) + ":" + os.environ.get('PYTHONPATH', '')
@@ -79,6 +80,24 @@ def run_worker(rank, world_size, args, gpu_ids, procs_per_gpu):
         '--use_distributed', 'True',
         '--deepspeed'  # 默认开启DeepSpeed
     ])
+    
+    # 设置工作分片参数，确保每个进程处理不同的工作
+    if '--balance_work' in cmd_args and cmd_args[cmd_args.index('--balance_work') + 1].lower() == 'true':
+        # 为每个进程添加工作分片ID和总分片数
+        cmd_args.extend([
+            '--shard_id', str(rank),
+            '--num_shards', str(world_size)
+        ])
+        print(f"进程 {rank} 被分配处理分片 {rank}/{world_size}")
+    
+    # 为多本书处理添加特定参数
+    if '--parallel_books' in cmd_args and cmd_args[cmd_args.index('--parallel_books') + 1].lower() == 'true':
+        # 为每个进程添加书籍分片ID
+        cmd_args.extend([
+            '--book_shard_id', str(rank),
+            '--book_num_shards', str(world_size)
+        ])
+        print(f"进程 {rank} 将处理第 {rank} 本书 (总共分配 {world_size} 个进程处理多本书)")
     
     # 检查是否已经有--headless参数
     if '--headless' not in cmd_args:
@@ -275,6 +294,8 @@ def main():
                         help='总进程数（默认等于GPU数量）')
     parser.add_argument('--procs_per_gpu', type=int, default=1,
                         help='每个GPU上运行的进程数（默认为1）')
+    parser.add_argument('--balance_workload', type=int, default=1,
+                        help='是否启用工作负载均衡（0=关闭，1=启用，默认1）')
     
     # 解析我们自己的参数
     my_args, app_args = parser.parse_known_args()
@@ -297,6 +318,20 @@ def main():
     
     # 获取可用的GPU IDs
     gpu_ids = list(range(num_gpus))
+    
+    # 如果启用了工作负载均衡，则在命令行参数中添加均衡标志
+    if my_args.balance_workload == 1:
+        for i, arg in enumerate(app_args):
+            if arg == '--ebook' and i + 1 < len(app_args):
+                # 添加工作负载均衡参数，确保每个进程处理电子书的不同部分
+                app_args.extend(['--balance_work', 'True'])
+                print("已启用工作负载均衡，将分配电子书的不同部分给每个进程处理")
+                break
+            elif arg == '--ebooks_dir' and i + 1 < len(app_args):
+                # 对于多本书情况，每个进程处理不同的书
+                app_args.extend(['--parallel_books', 'True'])
+                print("已启用多书并行处理，将不同的书分配给不同的进程")
+                break
     
     print(f"将使用 {num_gpus} 个GPU，每个GPU {procs_per_gpu} 个进程，总共 {total_procs} 个进程进行处理")
     

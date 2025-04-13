@@ -1005,7 +1005,8 @@ def convert_chapters_to_audio(session):
         # 设置是否打印详细日志的标志
         verbose_logging = session.get('verbose_logging', False)
         
-        with tqdm(total=total_sentences, desc='处理中', bar_format='{desc}: {n_fmt}/{total_fmt}', unit='step', initial=resume_sentence) as t:
+        # 禁用tqdm进度条输出，避免过多的"处理中: x/y"日志
+        with tqdm(total=total_sentences, desc='处理中', bar_format='{desc}: {n_fmt}/{total_fmt}', unit='step', initial=resume_sentence, disable=True) as t:
             for chapter in chapters_to_process:
                 if session['cancellation_requested']:
                     return False

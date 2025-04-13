@@ -287,22 +287,22 @@ Linux/Mac:
                             import deepspeed
                             print("DeepSpeed已加载，将用于分布式加速")
                             
-                            # 默认配置或从文件加载配置
-                            ds_config = None
-                            
                             # 如果提供了配置文件路径，则读取配置
                             if 'deepspeed_config' in args and args['deepspeed_config']:
                                 if os.path.exists(args['deepspeed_config']):
                                     import json
-                                    with open(args['deepspeed_config'], 'r') as f:
-                                        ds_config = json.load(f)
-                                    print(f"已加载DeepSpeed配置文件: {args['deepspeed_config']}")
+                                    import shutil
+                                    
+                                    # 如果指定的不是ds_config.json，则复制到ds_config.json
+                                    if os.path.basename(args['deepspeed_config']) != "ds_config.json":
+                                        # 复制配置文件到项目根目录的ds_config.json
+                                        print(f"将配置文件 {args['deepspeed_config']} 复制到 ds_config.json")
+                                        shutil.copy2(args['deepspeed_config'], "ds_config.json")
+                                    
+                                    print(f"DeepSpeed将使用配置文件: ds_config.json")
                             
-                            # 将DeepSpeed配置传递给lib/models.py中的settings
+                            # 设置分布式参数
                             from lib.models import default_xtts_settings
-                            
-                            if ds_config:
-                                default_xtts_settings['deepspeed_config'] = ds_config
                             
                             # 设置分布式参数
                             if 'RANK' in os.environ:
@@ -314,7 +314,7 @@ Linux/Mac:
                                      f"local_rank={default_xtts_settings['local_rank']}, "
                                      f"world_size={default_xtts_settings['world_size']}")
                             
-                            print("DeepSpeed配置已应用")
+                            print("DeepSpeed配置已准备就绪")
                         except ImportError:
                             print("警告: DeepSpeed未安装，无法启用DeepSpeed加速")
                         except Exception as e:

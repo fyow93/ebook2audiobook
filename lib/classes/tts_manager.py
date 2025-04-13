@@ -102,16 +102,34 @@ def load_coqui_tts_checkpoint(model_path, config_path, vocab_path, device):
         ds_config = None
         if default_xtts_settings['use_deepspeed'] and num_gpus > 1:
             try:
-                if os.path.exists("ds_config.json"):
-                    with open("ds_config.json", "r") as f:
+                # 总是尝试从ds_config.json加载配置
+                config_path = "ds_config.json"
+                if os.path.exists(config_path):
+                    with open(config_path, "r") as f:
                         ds_config = json.load(f)
-                    print("已加载DeepSpeed配置")
+                    print(f"已加载DeepSpeed配置文件: {config_path}")
                     
                     # 确保配置兼容多GPU
                     if 'zero_optimization' in ds_config:
                         print(f"使用ZeRO优化阶段: {ds_config['zero_optimization']['stage']}")
+                    
+                    # 记录一些重要的配置参数
+                    if 'train_batch_size' in ds_config:
+                        print(f"训练批次大小: {ds_config['train_batch_size']}")
+                    if 'train_micro_batch_size_per_gpu' in ds_config:
+                        print(f"每GPU微批次大小: {ds_config['train_micro_batch_size_per_gpu']}")
+                else:
+                    print(f"警告: 未找到DeepSpeed配置文件 {config_path}")
+                    print("DeepSpeed将使用默认配置运行，可能无法充分利用GPU资源")
+                    # 创建最小配置以确保DeepSpeed正常运行
+                    ds_config = {
+                        "train_batch_size": 32,
+                        "fp16": {"enabled": True},
+                        "zero_optimization": {"stage": 2}
+                    }
             except Exception as e:
                 print(f"加载DeepSpeed配置失败: {e}")
+                print("DeepSpeed将被禁用")
                 default_xtts_settings['use_deepspeed'] = False
         
         # 初始化TTS模型

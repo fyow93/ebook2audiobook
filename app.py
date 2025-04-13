@@ -146,7 +146,7 @@ Linux/Mac:
         '--temperature', '--length_penalty', '--num_beams', '--repetition_penalty',
         '--top_k', '--top_p', '--speed', '--enable_text_splitting', 
         '--output_dir', '--version', '--workflow', '--help', '--gpu_id', '--use_distributed',
-        '--deepspeed', '--deepspeed_config'
+        '--deepspeed', '--deepspeed_config', '--process_rank', '--total_processes'
     ]
     #tts_engine_list = [k for k in models.keys() if k != BARK]
     tts_engine_list = [k for k in models.keys()]
@@ -199,6 +199,10 @@ Linux/Mac:
     # DeepSpeed相关参数
     parser.add_argument('--deepspeed', action='store_true', default=True, help='''(Optional) Enable DeepSpeed for multi-GPU acceleration. Default: True''')
     parser.add_argument('--deepspeed_config', type=str, default=None, help='''(Optional) Path to DeepSpeed configuration file.''')
+    
+    # 添加进程分片参数，用于多进程负载均衡
+    parser.add_argument('--process_rank', type=int, default=0, help='''(Optional) 当前进程的序号，用于工作负载分片. 与--total_processes一起使用.''')
+    parser.add_argument('--total_processes', type=int, default=1, help='''(Optional) 总进程数，用于工作负载分片. 与--process_rank一起使用.''')
     
     for arg in sys.argv:
         if arg.startswith('--') and arg not in options:
@@ -258,85 +262,26 @@ Linux/Mac:
                 if os.path.exists(args['custom_model']):
                     args['custom_model'] = os.path.abspath(args['custom_model'])
                     
-            # 分布式处理设置
+            # 确保处理进程分片参数
+            args['process_rank'] = args.get('process_rank', 0)
+            args['total_processes'] = args.get('total_processes', 1)
+            
+            # 输出进程信息
+            if args['total_processes'] > 1:
+                print(f"多进程模式: 当前进程 {args['process_rank']}/{args['total_processes']}")
+            
+            progress_status, passed = None, False
             if args['device'] == 'cuda':
-                gpu_id = args['gpu_id']
-                use_distributed = True if 'use_distributed' not in args else args['use_distributed']
-                print(f"CUDA模式下使用GPU ID: {gpu_id}, 分布式模式: {'开启' if use_distributed else '关闭'}")
-                
-                # 检查可用的GPU
-                total_gpus = torch.cuda.device_count()
-                if total_gpus > 0:
-                    if gpu_id >= total_gpus:
-                        print(f"警告: 指定的GPU ID {gpu_id} 超出可用范围，将使用GPU 0")
-                        gpu_id = 0
-                    
-                    # 设置当前进程使用的GPU
-                    try:
-                        # 明确设置当前设备
-                        torch.cuda.set_device(gpu_id)
-                        print(f"当前进程已设置为使用GPU {gpu_id}")
-                        
-                        # 获取当前设备的名称和内存信息
-                        current_device = torch.cuda.current_device()
-                        device_name = torch.cuda.get_device_name(current_device)
-                        total_memory = torch.cuda.get_device_properties(current_device).total_memory / (1024**3)
-                        print(f"当前使用的GPU设备: {device_name}, 显存: {total_memory:.2f} GB")
-                        
-                        # 启用DeepSpeed（现在默认开启）
-                        try:
-                            # 尝试导入DeepSpeed
-                            import deepspeed
-                            print("DeepSpeed已加载，将用于分布式加速")
-                            
-                            # 如果提供了配置文件路径，则读取配置
-                            if 'deepspeed_config' in args and args['deepspeed_config']:
-                                if os.path.exists(args['deepspeed_config']):
-                                    # 如果指定的不是ds_config.json，则复制到ds_config.json
-                                    if os.path.basename(args['deepspeed_config']) != "ds_config.json":
-                                        # 复制配置文件到项目根目录的ds_config.json
-                                        print(f"将配置文件 {args['deepspeed_config']} 复制到 ds_config.json")
-                                        shutil.copy2(args['deepspeed_config'], "ds_config.json")
-                                    
-                                    # 读取并打印配置内容
-                                    with open("ds_config.json", "r") as f:
-                                        config_content = json.load(f)
-                                        print("\n================ app.py中读取的DeepSpeed配置 ================")
-                                        pprint.pprint(config_content)
-                                        print("=============================================================\n")
-                                    
-                                    print(f"DeepSpeed将使用配置文件: ds_config.json")
-                            
-                            # 设置分布式参数
-                            from lib.models import default_xtts_settings
-                            
-                            # 设置分布式参数
-                            if 'RANK' in os.environ:
-                                default_xtts_settings['is_distributed'] = True
-                                default_xtts_settings['rank'] = int(os.environ.get('RANK', '0'))
-                                default_xtts_settings['local_rank'] = int(os.environ.get('LOCAL_RANK', '0'))
-                                default_xtts_settings['world_size'] = int(os.environ.get('WORLD_SIZE', '1'))
-                                print(f"分布式参数已设置: rank={default_xtts_settings['rank']}, "
-                                     f"local_rank={default_xtts_settings['local_rank']}, "
-                                     f"world_size={default_xtts_settings['world_size']}")
-                            
-                            print("DeepSpeed配置已准备就绪")
-                        except ImportError:
-                            print("警告: DeepSpeed未安装，无法启用DeepSpeed加速")
-                        except Exception as e:
-                            print(f"配置DeepSpeed时出错: {e}")
-                    except Exception as e:
-                        print(f"设置GPU设备时出错: {e}")
-                        print("回退到默认GPU设置")
-                else:
-                    print("未检测到可用的GPU，将回退到CPU模式")
+                try:
+                    gpu_id = args['gpu_id']
+                    torch.cuda.set_device(gpu_id)
+                    print(f"使用 CUDA GPU #{gpu_id}")
+                except Exception as e:
+                    print(f"设置GPU设备时出错: {e}")
+                    print("回退到CPU模式")
                     args['device'] = 'cpu'
-                
-            if not os.path.exists(args['audiobooks_dir']):
-                error = 'Error: --output_dir path does not exist.'
-                print(error)
-                sys.exit(1)                
-            if args['ebooks_dir']:
+            
+            if args['ebooks_dir'] is not None:
                 args['ebooks_dir'] = os.path.abspath(args['ebooks_dir'])
                 if not os.path.exists(args['ebooks_dir']):
                     error = f'Error: The provided --ebooks_dir "{args["ebooks_dir"]}" does not exist.'

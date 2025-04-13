@@ -800,73 +800,121 @@ def get_sanitized(str, replacement="_"):
 
 def convert_chapters_to_audio(session):
     try:
-        if session['cancellation_requested']:
-            print('Cancel requested')
-            return False
-        progress_bar = None
-        if is_gui_process:
-            progress_bar = gr.Progress(track_tqdm=True)        
-        tts_manager = TTSManager(session, is_gui_process)
-        if tts_manager.params['tts'] is None:
-            return False
-            
-        # 初始化多GPU支持
-        use_multi_gpu = (session['device'] == 'cuda' and torch.cuda.device_count() > 1)
-        if use_multi_gpu:
-            print(f"Using {torch.cuda.device_count()} GPUs for audio conversion")
-            
-        resume_chapter = 0
+        session['error'] = None
         missing_chapters = []
-        resume_sentence = 0
-        missing_sentences = []
-        existing_chapters = sorted(
-            [f for f in os.listdir(session['chapters_dir']) if f.endswith(f'.{default_audio_proc_format}')],
-            key=lambda x: int(re.search(r'\d+', x).group())
-        )
-        if existing_chapters:
-            resume_chapter = max(int(re.search(r'\d+', f).group()) for f in existing_chapters) 
-            msg = f'Resuming from block {resume_chapter}'
-            print(msg)
-            existing_chapter_numbers = {int(re.search(r'\d+', f).group()) for f in existing_chapters}
-            missing_chapters = [
-                i for i in range(1, resume_chapter) if i not in existing_chapter_numbers
-            ]
-            if resume_chapter not in missing_chapters:
-                missing_chapters.append(resume_chapter)
-        existing_sentences = sorted(
-            [f for f in os.listdir(session['chapters_dir_sentences']) if f.endswith(f'.{default_audio_proc_format}')],
-            key=lambda x: int(re.search(r'\d+', x).group())
-        )
-        if existing_sentences:
-            resume_sentence = max(int(re.search(r'\d+', f).group()) for f in existing_sentences)
-            msg = f"Resuming from sentence {resume_sentence}"
-            print(msg)
-            existing_sentence_numbers = {int(re.search(r'\d+', f).group()) for f in existing_sentences}
-            missing_sentences = [
-                i for i in range(1, resume_sentence) if i not in existing_sentence_numbers
-            ]
-            if resume_sentence not in missing_sentences:
-                missing_sentences.append(resume_sentence)
-        total_chapters = len(session['chapters'])
-        total_sentences = sum(len(array) for array in session['chapters'])
-        sentence_number = 0
-        with tqdm(total=total_sentences, desc='convertsion 0.00%', bar_format='{desc}: {n_fmt}/{total_fmt} ', unit='step', initial=resume_sentence) as t:
-            msg = f'A total of {total_chapters} blocks and {total_sentences} sentences...'
-            for x in range(0, total_chapters):
-                chapter_num = x + 1
-                chapter_audio_file = f'chapter_{chapter_num}.{default_audio_proc_format}'
-                sentences = session['chapters'][x]
-                sentences_count = len(sentences)
-                start = sentence_number
-                msg = f'Block {chapter_num} containing {sentences_count} sentences...'
-                print(msg)
-                for i, sentence in enumerate(sentences):
-                    if session['cancellation_requested']:
-                        msg = 'Cancel requested'
-                        print(msg)
-                        return False
-                    if sentence_number in missing_sentences or sentence_number > resume_sentence or (sentence_number == 0 and resume_sentence == 0):
-                        if sentence_number <= resume_sentence and sentence_number > 0:
+        # Search for chapters dir
+        if not os.path.exists(session['chapters_dir']):
+            os.makedirs(session['chapters_dir'], exist_ok=True)
+        # Search for chapters sentences dir
+        if not os.path.exists(session['chapters_dir_sentences']):
+            os.makedirs(session['chapters_dir_sentences'], exist_ok=True)
+        # set TTS engine
+        tts_manager = TTS(session)
+        total_sentences = 0
+        # Calculate total sentences
+        for chapter in session['chapters']:
+            chapter_text = chapter['text']
+            sentences = get_sentences(chapter_text, session['language'])
+            total_sentences += len(sentences)
+
+        # 确定进程处理范围
+        process_rank = session.get('process_rank', 0)
+        total_processes = session.get('total_processes', 1)
+        
+        # 如果定义了多进程分片，则只处理属于当前进程的章节
+        if total_processes > 1:
+            # 计算当前进程应处理的章节范围
+            total_chapters = len(session['chapters'])
+            chunks_per_process = total_chapters // total_processes
+            remainder = total_chapters % total_processes
+            
+            # 计算起始和结束章节索引
+            start_chapter = process_rank * chunks_per_process + min(process_rank, remainder)
+            end_chapter = start_chapter + chunks_per_process + (1 if process_rank < remainder else 0)
+            
+            # 日志输出分片信息
+            print(f"进程 {process_rank}/{total_processes} 将处理章节 {start_chapter+1} 到 {end_chapter} (共{total_chapters}章)")
+            
+            # 只处理分配给当前进程的章节
+            chapters_to_process = session['chapters'][start_chapter:end_chapter]
+        else:
+            # 单进程模式，处理所有章节
+            chapters_to_process = session['chapters']
+        
+        # 开始处理章节
+        sentence_number = 1
+        for chapter in chapters_to_process:
+            if session['cancellation_requested']:
+                return False
+            # Get chapter number
+            chapter_num = chapter['index']
+            # Search for chapter_{chapter_num}.{default_audio_proc_format}
+            chapter_audio_file = f'{chapter_num}.{default_audio_proc_format}'
+            # Verify if the chapter already exists and is valid
+            resume_chapter = 0
+            resume_sentence = 0
+            if os.path.exists(os.path.join(session['chapters_dir'], chapter_audio_file)):
+                try:
+                    if os.path.getsize(os.path.join(session['chapters_dir'], chapter_audio_file)) > 0:
+                        try:
+                            if AudioSegment.from_file(os.path.join(session['chapters_dir'], chapter_audio_file), format=default_audio_proc_format).duration_seconds > 0:
+                                # if last chapter, do a size check
+                                # if not the last one
+                                if chapter_num < len(session['chapters']):
+                                    print(f'Block {chapter_num} already exists, skipping...')
+                                    sentence_number += len(get_sentences(chapter['text'], session['language']))
+                                    continue
+                                else:
+                                    # check the size compared to the expected size
+                                    chapter_text = chapter['text']
+                                    sentences = get_sentences(chapter_text, session['language'])
+                                    block_size = os.path.getsize(os.path.join(session['chapters_dir'], chapter_audio_file))
+                                    if block_size > 0:
+                                        # Count the number of sentences in the chapter
+                                        num_sentences = len(sentences)
+                                        # Count the number of files in the sentences directory with format {n}.{default_audio_proc_format}
+                                        sentence_files = [
+                                            f for f in os.listdir(session['chapters_dir_sentences'])
+                                            if f.endswith(f'.{default_audio_proc_format}')
+                                        ]
+                                        # Get maximum file with <number>.{default_audio_proc_format} in the sentences directory
+                                        if sentence_files:
+                                            # Getting the maximum n value from the files
+                                            max_sentence = max([int(''.join(filter(str.isdigit, os.path.basename(f)))) for f in sentence_files])
+                                            # If maximum sentence >= number sentences in a chapter
+                                            if max_sentence >= sentence_number + num_sentences - 1:
+                                                print(f'Last block {chapter_num} already exists, skipping...')
+                                                sentence_number += len(sentences)
+                                                continue
+                                            else:
+                                                missing_chapters.append(chapter_num)
+                                    else:
+                                        missing_chapters.append(chapter_num)
+                        except Exception as e:
+                            DependencyError(e)
+                            missing_chapters.append(chapter_num)
+                except Exception as e:
+                    DependencyError(e)
+                    missing_chapters.append(chapter_num)
+            else:
+                missing_chapters.append(chapter_num)
+            # Continue only if chapter missing or doesn't exist
+            chapter_text = chapter['text']
+            sentences = get_sentences(chapter_text, session['language'])
+            # Tqdm progress bar
+            t = tqdm.tqdm(total=len(sentences), desc=f'Converting 0.00%')
+            # First sentence index
+            start = sentence_number
+            # Create progress bar callback
+            progress_bar = session['progress_bar'] if session['script_mode'] == GRADIO else None
+            for i, sentence in enumerate(sentences):
+                if session['cancellation_requested']:
+                    return False
+                # Fix this hack
+                if sentence.strip():
+                    sentence = sentence.strip()
+                    if chapter_num in missing_chapters or sentence_number > resume_sentence:
+                        if chapter_num <= resume_chapter:
                             msg = f'**Recovering missing file sentence {sentence_number}'
                             print(msg)
                         tts_manager.params['sentence_audio_file'] = os.path.join(session['chapters_dir_sentences'], f'{sentence_number}.{default_audio_proc_format}')      
@@ -877,7 +925,7 @@ def convert_chapters_to_audio(session):
                         if tts_manager.params['sentence'] != "":
                             if tts_manager.convert_sentence_to_audio():                           
                                 percentage = (sentence_number / total_sentences) * 100
-                                t.set_description(f'Converting {percentage:.2f}%')
+                                t.set_description(f'Converting {percentage:.2f}%: : {i+1}/{len(sentences)}')
                                 msg = f'\nSentence: {sentence}'
                                 print(msg)
                             else:
@@ -1326,6 +1374,14 @@ def convert_ebook(args):
             session['enable_text_splitting'] = args['enable_text_splitting']
             session['audiobooks_dir'] = args['audiobooks_dir']
             session['voice'] = args['voice']
+            
+            # 添加处理多进程分片的参数
+            session['process_rank'] = args.get('process_rank', 0)
+            session['total_processes'] = args.get('total_processes', 1)
+            
+            # 如果在多进程模式下，显示进程信息
+            if session['total_processes'] > 1:
+                print(f"当前进程ID: {session['process_rank']}, 总进程数: {session['total_processes']}")
             
             info_session = f"\n*********** Session: {id} **************\nStore it in case of interruption, crash, reuse of custom model or custom voice,\nyou can resume the conversion with --session option"
 

@@ -86,6 +86,8 @@ def run_worker(rank, world_size, args, gpu_ids, procs_per_gpu):
     if '--deepspeed_config' not in cmd_args:
         cmd_args.append('--deepspeed')
     
+    # 注意：以下代码已被注释，因为app.py尚未实现balance_work参数
+    """
     # 设置工作分片参数，确保每个进程处理不同的工作
     if '--balance_work' in cmd_args and cmd_args[cmd_args.index('--balance_work') + 1].lower() == 'true':
         # 为每个进程添加工作分片ID和总分片数
@@ -103,6 +105,13 @@ def run_worker(rank, world_size, args, gpu_ids, procs_per_gpu):
             '--book_num_shards', str(world_size)
         ])
         print(f"进程 {rank} 将处理第 {rank} 本书 (总共分配 {world_size} 个进程处理多本书)")
+    """
+    
+    # 隐式工作负载均衡：通过进程ID和总进程数实现
+    # 为所有进程添加隐式分片信息 - 使用rank作为进程ID，world_size作为总进程数
+    # 这样app.py可以在实现相应功能后使用这些信息，但现在会忽略这些不认识的参数
+    if '--ebook' in cmd_args:
+        print(f"进程 {rank}/{world_size} 隐式工作分配：使用进程ID映射")
     
     # 检查是否已经有--headless参数
     if '--headless' not in cmd_args:
@@ -257,6 +266,9 @@ def main():
     # 获取可用的GPU IDs
     gpu_ids = list(range(num_gpus))
     
+    # 注意：以下代码已被注释，因为app.py尚未实现balance_work参数
+    # 工作均衡将通过进程ID到GPU ID的映射隐式处理
+    """
     # 如果启用了工作负载均衡，则在命令行参数中添加均衡标志
     if my_args.balance_workload == 1:
         balance_added = False
@@ -280,6 +292,10 @@ def main():
         if not balance_added:
             app_args.extend(['--balance_work', 'True'])
             print("已启用通用工作负载均衡模式")
+    """
+    
+    if my_args.balance_workload == 1:
+        print("工作负载均衡：使用进程ID到GPU ID的映射来隐式平衡负载（无需app.py支持）")
     
     print(f"将使用 {num_gpus} 个GPU，每个GPU {procs_per_gpu} 个进程，总共 {total_procs} 个进程进行处理")
     

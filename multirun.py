@@ -53,7 +53,7 @@ def cleanup_distributed():
         dist.destroy_process_group()
         print("已销毁分布式进程组")
 
-def run_worker(rank, world_size, args, gpu_ids):
+def run_worker(rank, world_size, args, gpu_ids, procs_per_gpu):
     """每个工作进程的执行函数"""
     # 设置分布式环境
     success = setup_distributed(rank, world_size)
@@ -61,10 +61,11 @@ def run_worker(rank, world_size, args, gpu_ids):
         print(f"进程 {rank} 无法初始化分布式环境，退出")
         return
     
-    # 获取当前进程的GPU ID
-    gpu_id = gpu_ids[rank] if rank < len(gpu_ids) else rank
+    # 计算当前进程应该使用的GPU ID
+    # 现在一个GPU可能负责多个进程，因此使用整除确定GPU ID
+    gpu_id = gpu_ids[rank // procs_per_gpu] if rank // procs_per_gpu < len(gpu_ids) else rank % len(gpu_ids)
     
-    print(f"工作进程 {rank} 使用 GPU ID: {gpu_id}")
+    print(f"工作进程 {rank} 使用 GPU ID: {gpu_id} (GPU上的第{rank % procs_per_gpu + 1}个进程)")
     
     # 设置DeepSpeed相关环境变量
     os.environ['PYTHONPATH'] = os.path.dirname(os.path.abspath(__file__)) + ":" + os.environ.get('PYTHONPATH', '')
@@ -271,28 +272,43 @@ def main():
     # 添加分布式支持到命令行参数
     parser = argparse.ArgumentParser(description='启动多GPU处理')
     parser.add_argument('--nproc_per_node', type=int, default=num_gpus,
-                        help='每个节点使用的进程数（通常等于GPU数量）')
+                        help='总进程数（默认等于GPU数量）')
+    parser.add_argument('--procs_per_gpu', type=int, default=1,
+                        help='每个GPU上运行的进程数（默认为1）')
     
     # 解析我们自己的参数
     my_args, app_args = parser.parse_known_args()
     
-    # 确保进程数不超过GPU数量
-    nproc_per_node = min(my_args.nproc_per_node, num_gpus)
+    # 计算每个GPU的进程数
+    procs_per_gpu = my_args.procs_per_gpu
+    
+    # 如果指定了总进程数但没有指定每GPU进程数，则计算每GPU进程数
+    if my_args.nproc_per_node > num_gpus and procs_per_gpu == 1:
+        procs_per_gpu = my_args.nproc_per_node // num_gpus
+        print(f"根据总进程数计算得到每GPU进程数: {procs_per_gpu}")
+    
+    # 计算总进程数
+    total_procs = num_gpus * procs_per_gpu
+    
+    # 使用指定的总进程数（如果提供）
+    if my_args.nproc_per_node != num_gpus:
+        total_procs = my_args.nproc_per_node
+        print(f"使用指定的总进程数: {total_procs}")
     
     # 获取可用的GPU IDs
     gpu_ids = list(range(num_gpus))
     
-    print(f"将使用 {nproc_per_node} 个进程进行处理")
+    print(f"将使用 {num_gpus} 个GPU，每个GPU {procs_per_gpu} 个进程，总共 {total_procs} 个进程进行处理")
     
     # 设置多处理方法为spawn（必须为多GPU支持）
     mp.set_start_method('spawn', force=True)
     
     # 创建进程
     processes = []
-    for rank in range(nproc_per_node):
+    for rank in range(total_procs):
         p = mp.Process(
             target=run_worker,
-            args=(rank, nproc_per_node, app_args, gpu_ids)
+            args=(rank, total_procs, app_args, gpu_ids, procs_per_gpu)
         )
         p.start()
         processes.append(p)

@@ -17,6 +17,7 @@ import signal
 from pathlib import Path
 import tempfile
 import shutil
+import re
 
 def get_num_gpus():
     """获取可用的GPU数量"""
@@ -166,6 +167,7 @@ def run_worker(rank, world_size, args, gpu_ids):
         )
         
         # 实时输出进程日志
+        last_lines = {}  # 为每个进度类型记录最后一行日志，用于去重
         for line in iter(process.stdout.readline, ''):
             # 过滤掉页面分割和文件解析等冗长日志消息
             should_log = True
@@ -185,6 +187,29 @@ def run_worker(rank, world_size, args, gpu_ids):
                 if pattern in line:
                     should_log = False
                     break
+            
+            # 增强的去重逻辑
+            line_content = line.strip()
+            
+            # 特别处理转换进度日志
+            if "Converting" in line_content:
+                # 提取进度百分比和数字作为键
+                progress_key = ""
+                match = re.search(r'Converting ([\d.]+)%: : (\d+)', line_content)
+                if match:
+                    progress_key = f"Converting_{match.group(1)}_{match.group(2)}"
+                    
+                    # 检查是否是重复的转换进度
+                    if progress_key in last_lines:
+                        should_log = False
+                    else:
+                        last_lines[progress_key] = True
+                        # 限制字典大小，防止内存泄漏
+                        if len(last_lines) > 1000:
+                            # 只保留最新的500个条目
+                            keys_to_remove = list(last_lines.keys())[:-500]
+                            for key in keys_to_remove:
+                                last_lines.pop(key, None)
             
             # 只输出应该记录的日志
             if should_log:

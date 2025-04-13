@@ -86,32 +86,15 @@ def run_worker(rank, world_size, args, gpu_ids, procs_per_gpu):
     if '--deepspeed_config' not in cmd_args:
         cmd_args.append('--deepspeed')
     
-    # 注意：以下代码已被注释，因为app.py尚未实现balance_work参数
-    """
-    # 设置工作分片参数，确保每个进程处理不同的工作
-    if '--balance_work' in cmd_args and cmd_args[cmd_args.index('--balance_work') + 1].lower() == 'true':
-        # 为每个进程添加工作分片ID和总分片数
-        cmd_args.extend([
-            '--shard_id', str(rank),
-            '--num_shards', str(world_size)
-        ])
-        print(f"进程 {rank} 被分配处理分片 {rank}/{world_size}")
-    
-    # 为多本书处理添加特定参数
-    if '--parallel_books' in cmd_args and cmd_args[cmd_args.index('--parallel_books') + 1].lower() == 'true':
-        # 为每个进程添加书籍分片ID
-        cmd_args.extend([
-            '--book_shard_id', str(rank),
-            '--book_num_shards', str(world_size)
-        ])
-        print(f"进程 {rank} 将处理第 {rank} 本书 (总共分配 {world_size} 个进程处理多本书)")
-    """
-    
-    # 隐式工作负载均衡：通过进程ID和总进程数实现
-    # 为所有进程添加隐式分片信息 - 使用rank作为进程ID，world_size作为总进程数
-    # 这样app.py可以在实现相应功能后使用这些信息，但现在会忽略这些不认识的参数
+    # 实现工作分片 - 添加处理范围控制
+    # 使用rank和world_size来确定每个进程应该处理的范围
     if '--ebook' in cmd_args:
-        print(f"进程 {rank}/{world_size} 隐式工作分配：使用进程ID映射")
+        # 针对电子书处理，添加范围参数
+        cmd_args.extend([
+            '--process_rank', str(rank),
+            '--total_processes', str(world_size)
+        ])
+        print(f"进程 {rank}/{world_size} 将只处理其对应的工作分片")
     
     # 检查是否已经有--headless参数
     if '--headless' not in cmd_args:
@@ -243,6 +226,8 @@ def main():
                         help='每个GPU上运行的进程数（默认为1）')
     parser.add_argument('--balance_workload', type=int, default=1,
                         help='是否启用工作负载均衡（0=关闭，1=启用，默认1）')
+    parser.add_argument('--output_dir', type=str, default="output",
+                        help='输出文件的汇总目录（默认为当前目录下的output）')
     
     # 解析我们自己的参数
     my_args, app_args = parser.parse_known_args()
@@ -320,6 +305,65 @@ def main():
     cleanup_temp_files()
     
     print("所有进程已完成")
+    
+    # 创建输出目录（如果不存在）
+    output_dir = my_args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"正在将所有音频文件汇总到 {output_dir} 目录...")
+    
+    # 寻找并复制所有音频文件
+    collect_audio_files(output_dir)
+    
+    print(f"音频文件汇总完成，请查看 {output_dir} 目录")
+
+def collect_audio_files(output_dir):
+    """收集所有音频文件到指定的输出目录"""
+    try:
+        # 查找tmp目录
+        tmp_dir = os.path.join(os.getcwd(), "tmp")
+        if not os.path.exists(tmp_dir):
+            print(f"警告: 未找到临时目录 {tmp_dir}")
+            return
+            
+        # 搜索所有可能的音频文件格式
+        audio_formats = ['.flac', '.mp3', '.wav', '.m4a', '.m4b', '.ogg', '.aac']
+        copied_files = 0
+        
+        # 创建日志文件来跟踪复制的文件
+        log_file = os.path.join(output_dir, "audio_files_log.txt")
+        
+        with open(log_file, "w", encoding="utf-8") as log:
+            # 递归搜索tmp目录下的所有音频文件
+            for root, dirs, files in os.walk(tmp_dir):
+                for file in files:
+                    if any(file.lower().endswith(ext) for ext in audio_formats):
+                        # 找到音频文件
+                        src_path = os.path.join(root, file)
+                        
+                        # 创建目标路径，保持相对于tmp目录的相对路径结构
+                        rel_path = os.path.relpath(root, tmp_dir)
+                        if rel_path != ".":
+                            # 如果是子目录，创建相应的目录结构
+                            dest_dir = os.path.join(output_dir, rel_path)
+                            os.makedirs(dest_dir, exist_ok=True)
+                            dest_path = os.path.join(dest_dir, file)
+                        else:
+                            # 如果是根目录，直接放在输出目录中
+                            dest_path = os.path.join(output_dir, file)
+                        
+                        # 复制文件
+                        try:
+                            shutil.copy2(src_path, dest_path)
+                            copied_files += 1
+                            log.write(f"已复制: {src_path} -> {dest_path}\n")
+                        except Exception as e:
+                            log.write(f"复制失败: {src_path} -> {dest_path}, 错误: {str(e)}\n")
+        
+        print(f"共复制了 {copied_files} 个音频文件到 {output_dir} 目录")
+        print(f"详细日志请查看: {log_file}")
+        
+    except Exception as e:
+        print(f"收集音频文件时出错: {str(e)}")
 
 if __name__ == "__main__":
     main() 

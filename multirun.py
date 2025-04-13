@@ -20,7 +20,6 @@ import shutil
 import re
 import json
 import datetime
-from lib.functions import combine_audio_chapters
 from lib.conf import device_list, default_audio_proc_format
 
 # 进度收集相关的常量
@@ -493,6 +492,9 @@ def main():
     # 尝试合并章节音频文件
     try:
         print("正在尝试合并所有章节为完整有声书...")
+        # 在这里导入函数，而不是在模块顶部
+        from lib.functions import combine_audio_chapters
+        
         # 查找所有可能的会话目录
         for root, dirs, files in os.walk(os.getcwd()):
             if "process" in dirs:

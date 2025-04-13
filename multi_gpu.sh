@@ -3,7 +3,15 @@
 # 开启调试输出
 set -x
 
+# 创建日志文件，如果已存在则清空
+LOG_FILE="output.log"
+> $LOG_FILE
+
+# 将所有后续输出重定向到日志文件，同时保留终端输出
+exec > >(tee -a "$LOG_FILE") 2>&1
+
 echo "多GPU处理脚本启动..."
+echo "所有日志将被保存到 $LOG_FILE"
 
 # 从参数中提取--procs_per_gpu、--balance_workload和--output_dir参数
 PROCS_PER_GPU=4  # 默认每个GPU 4个进程
@@ -18,6 +26,12 @@ for arg in "$@"; do
         BALANCE_WORKLOAD="${arg#*=}"
     elif [[ $arg == --output_dir=* ]]; then
         OUTPUT_DIR="${arg#*=}"
+    elif [[ $arg == --log_file=* ]]; then
+        LOG_FILE="${arg#*=}"
+        # 如果指定了新的日志文件，重新设置输出重定向
+        > $LOG_FILE
+        exec > >(tee -a "$LOG_FILE") 2>&1
+        echo "日志将被保存到 $LOG_FILE"
     else
         APP_ARGS+=("$arg")
     fi
@@ -76,14 +90,15 @@ echo "设置CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 
 # 如果没有提供参数，显示帮助信息
 if [ ${#APP_ARGS[@]} -eq 0 ]; then
-    echo "使用方法: ./multi_gpu.sh [--procs_per_gpu=N] [--balance_workload=0|1] [--output_dir=DIR] [app.py参数]"
+    echo "使用方法: ./multi_gpu.sh [--procs_per_gpu=N] [--balance_workload=0|1] [--output_dir=DIR] [--log_file=FILE] [app.py参数]"
     echo "选项:"
     echo "  --procs_per_gpu=N     设置每个GPU运行的进程数，默认为4，最大为8"
     echo "  --balance_workload=N  是否开启工作负载均衡(0=关闭,1=开启)，默认1"
     echo "  --output_dir=DIR      设置输出文件的汇总目录，默认为当前目录下的output"
+    echo "  --log_file=FILE       设置日志文件路径，默认为output.log"
     echo "例如:"
-    echo "  ./multi_gpu.sh --procs_per_gpu=2 --balance_workload=1 --output_dir=my_audiobooks --headless --ebook path/to/book.epub"
-    echo "  ./multi_gpu.sh --headless --ebooks_dir path/to/books/ --output_dir=audiobooks_output"
+    echo "  ./multi_gpu.sh --procs_per_gpu=2 --balance_workload=1 --output_dir=my_audiobooks --log_file=conversion.log --headless --ebook path/to/book.epub"
+    echo "  ./multi_gpu.sh --headless --ebooks_dir path/to/books/ --output_dir=audiobooks_output --log_file=batch_conversion.log"
     exit 1
 fi
 

@@ -446,6 +446,23 @@ def normalize_text(text, lang, lang_iso1, tts_engine):
     pattern = '|'.join(map(re.escape, punctuation_split))
     # Reduce multiple consecutive punctuations
     text = re.sub(rf'(\s*({pattern})\s*)+', r'\2 ', text).strip()
+    
+    # 中文文本特别处理
+    if lang == 'zho':
+        # 1. 修复中英文之间缺少空格的问题
+        text = re.sub(r'([a-zA-Z])([\u4e00-\u9fff])', r'\1 \2', text)
+        text = re.sub(r'([\u4e00-\u9fff])([a-zA-Z])', r'\1 \2', text)
+        
+        # 2. 确保数字与中文之间有空格
+        text = re.sub(r'(\d)([\u4e00-\u9fff])', r'\1 \2', text)
+        text = re.sub(r'([\u4e00-\u9fff])(\d)', r'\1 \2', text)
+        
+        # 3. 优化中文标点符号
+        # 将连续的中文标点符号规范化为单个
+        cjk_puncts = ['。', '，', '、', '；', '：', '！', '？', '…']
+        for p in cjk_puncts:
+            text = re.sub(f'{p}+', p, text)
+    
     if tts_engine == XTTSv2:
         # Pattern 1: Add a space between UTF-8 characters and numbers
         text = re.sub(r'(?<=[\p{L}])(?=\d)|(?<=\d)(?=[\p{L}])', ' ', text)
@@ -630,17 +647,15 @@ def get_sentences(text, lang):
     pattern_split = [re.escape(p) for p in punctuation_split]
     pattern = f"({'|'.join(pattern_split)})"
 
-    def segment_ideogramms():
+    def segment_ideogramms(text_str):
         # 确保text是字符串类型
-        if not isinstance(text, str):
-            if isinstance(text, list):
+        if not isinstance(text_str, str):
+            if isinstance(text_str, list):
                 # 如果是列表，尝试连接为字符串
-                text_str = ' '.join(str(item) for item in text)
+                text_str = ' '.join(str(item) for item in text_str)
             else:
                 # 其他情况，尝试转换为字符串
-                text_str = str(text)
-        else:
-            text_str = text
+                text_str = str(text_str)
 
         if lang == 'zho':
             import jieba
@@ -710,21 +725,112 @@ def get_sentences(text, lang):
         part2 = sentence[split_index + 1:] if sentence[split_index] in [' ', ',', ';', ':'] else sentence[split_index:]
         return split_sentence(part1.strip()) + split_sentence(part2.strip())     
 
-    if lang in ['zho', 'jpn', 'kor', 'tha', 'lao', 'mya', 'khm']:
-        raw_list = segment_ideogramms()
-    else:
-        raw_list = re.split(pattern, text)
+    # 确保text是字符串类型
+    if not isinstance(text, str):
+        if isinstance(text, list):
+            text = ' '.join(str(item) for item in text)
+        else:
+            text = str(text)
 
-    if len(raw_list) > 1:
-        tmp_list = [raw_list[i] + raw_list[i + 1] for i in range(0, len(raw_list) - 1, 2)]
-    else:
-        tmp_list = raw_list
+    if lang in ['zho', 'jpn', 'kor', 'tha', 'lao', 'mya', 'khm']:
+        # 对于中文等语言，先按标点符号分句，再进行分词处理
+        # 中文标点符号
+        cjk_puncts = ['。', '！', '？', '；', '…', '，']
         
-    if tmp_list[-1] == 'Start':
-        tmp_list.pop()
-    sentences = []
-    for sentence in tmp_list:
-        sentences.extend(split_sentence(sentence.strip()))  
+        # 构建更精确的中文句子分割模式
+        if lang == 'zho':
+            # 通过正则表达式寻找完整句子
+            # 模式说明：
+            # 1. 寻找以句号、问号、感叹号等结尾的句子
+            # 2. 如果找不到结尾标点，则把整块文本作为一个句子
+            sentences = []
+            
+            # 定义句子结束的标点符号模式
+            end_puncts = ['。', '！', '？', '…']
+            end_pattern = '|'.join(map(re.escape, end_puncts))
+            
+            # 使用正则表达式匹配完整句子
+            sent_pattern = f'[^{end_pattern}]*[{end_pattern}]'
+            matches = re.finditer(sent_pattern, text)
+            
+            last_end = 0
+            for match in matches:
+                start, end = match.span()
+                if start > last_end:
+                    # 添加中间可能漏掉的不带结束标点的文本
+                    fragment = text[last_end:start].strip()
+                    if fragment:
+                        sentences.append(fragment)
+                sentences.append(match.group().strip())
+                last_end = end
+            
+            # 处理最后剩余的文本
+            if last_end < len(text):
+                remaining = text[last_end:].strip()
+                if remaining:
+                    sentences.append(remaining)
+                    
+            # 确保所有句子都不超过最大长度
+            result_sentences = []
+            for sent in sentences:
+                if len(sent) > max_chars:
+                    # 较长的句子需要进一步分割
+                    result_sentences.extend(split_sentence(sent))
+                else:
+                    result_sentences.append(sent)
+            
+            return result_sentences
+        else:
+            # 其他CJK语言使用原有的分句逻辑
+            # 添加中文特有的句子结束符
+            cjk_pattern = '|'.join(map(re.escape, cjk_puncts))
+            cjk_pattern = f"({cjk_pattern})"
+            
+            # 先按句子拆分
+            sent_list = []
+            # 使用正则表达式按照标点符号分句
+            segments = re.split(cjk_pattern, text)
+            
+            # 组合标点符号和前面的文本
+            if len(segments) > 1:
+                for i in range(0, len(segments)-1, 2):
+                    if i+1 < len(segments):
+                        sent_list.append(segments[i] + segments[i+1])
+                    else:
+                        sent_list.append(segments[i])
+                
+                # 处理最后一个元素
+                if len(segments) % 2 == 1:
+                    sent_list.append(segments[-1])
+            else:
+                sent_list = [text]
+                
+            # 过滤空字符串
+            sent_list = [s for s in sent_list if s.strip()]
+            
+            # 对每个句子使用jieba分词，但保持句子的完整性
+            sentences = []
+            for sent in sent_list:
+                if len(sent) > max_chars:
+                    # 较长的句子需要进一步分割
+                    sentences.extend(split_sentence(sent.strip()))
+                else:
+                    sentences.append(sent.strip())
+            return sentences
+    else:
+        # 非中文等语言，使用原来的分词方法
+        raw_list = re.split(pattern, text)
+        if len(raw_list) > 1:
+            tmp_list = [raw_list[i] + raw_list[i + 1] for i in range(0, len(raw_list) - 1, 2)]
+        else:
+            tmp_list = raw_list
+            
+        if tmp_list and tmp_list[-1] == 'Start':
+            tmp_list.pop()
+        sentences = []
+        for sentence in tmp_list:
+            sentences.extend(split_sentence(sentence.strip()))  
+    
     #print(json.dumps(sentences, indent=4, ensure_ascii=False))
     return sentences
 
@@ -1112,7 +1218,16 @@ def convert_chapters_to_audio(session):
                             # 设置句子转换参数
                             tts_manager.params['sentence_audio_file'] = os.path.join(session['chapters_dir_sentences'], f'{sentence_number}.{default_audio_proc_format}')      
                             if session['tts_engine'] == XTTSv2 or session['tts_engine'] == FAIRSEQ:
-                                tts_manager.params['sentence'] = sentence.replace('.', '…')
+                                # 对于中文句子，特殊处理以提高朗读质量
+                                if session['language'] == 'zho':
+                                    # 确保中文句子末尾有标点符号
+                                    if not any(sentence.endswith(p) for p in ['。', '！', '？', '；', '…']):
+                                        sentence = sentence + '。'  # 如果没有标点，添加句号
+                                    
+                                    # 替换英文句号为中文省略号，以获得更好的停顿效果
+                                    tts_manager.params['sentence'] = sentence.replace('.', '…')
+                                else:
+                                    tts_manager.params['sentence'] = sentence.replace('.', '…')
                             else:
                                 tts_manager.params['sentence'] = sentence
                                 

@@ -915,59 +915,419 @@ def get_sanitized(str, replacement="_"):
     sanitized = sanitized.strip("_")
     return sanitized
 
+def _initialize_tts_and_progress(session):
+    """Initialize TTS engine and progress tracking for audio conversion."""
+    # 初始化进度条
+    progress_bar = None
+    if is_gui_process:
+        progress_bar = gr.Progress(track_tqdm=True)
+        
+    # 初始化TTS引擎    
+    tts_manager = TTSManager(session, is_gui_process)
+    if tts_manager.params['tts'] is None:
+        return None, None
+        
+    # 初始化多GPU支持
+    use_multi_gpu = (session['device'] == 'cuda' and torch.cuda.device_count() > 1)
+    if use_multi_gpu:
+        print(f"Using {torch.cuda.device_count()} GPUs for audio conversion")
+    
+    # 检查目录
+    if not os.path.exists(session['chapters_dir']):
+        os.makedirs(session['chapters_dir'], exist_ok=True)
+    if not os.path.exists(session['chapters_dir_sentences']):
+        os.makedirs(session['chapters_dir_sentences'], exist_ok=True)
+    
+    return tts_manager, progress_bar
+
+def _prepare_chapters_data(session):
+    """Preprocess and format chapters data to ensure correct structure."""
+    formatted_chapters = []
+    if session['chapters'] is not None:
+        for idx, chapter_content in enumerate(session['chapters']):
+            # 检查chapter是否已经是字典格式
+            if isinstance(chapter_content, dict) and 'text' in chapter_content and 'index' in chapter_content:
+                # 确保文本是字符串类型
+                if not isinstance(chapter_content['text'], str):
+                    if isinstance(chapter_content['text'], list):
+                        chapter_content['text'] = ' '.join(str(item) for item in chapter_content['text'])
+                    else:
+                        chapter_content['text'] = str(chapter_content['text'])
+                formatted_chapters.append(chapter_content)
+            else:
+                # 如果是纯文本，转换为字典格式
+                text_content = chapter_content
+                if not isinstance(text_content, str):
+                    if isinstance(text_content, list):
+                        text_content = ' '.join(str(item) for item in text_content)
+                    else:
+                        text_content = str(text_content)
+                formatted_chapters.append({
+                    'index': idx + 1,
+                    'text': text_content
+                })
+    return formatted_chapters
+
+def _determine_resume_points(session):
+    """Determine resume points by checking existing files."""
+    resume_chapter = 0
+    resume_sentence = 0
+    missing_chapters = []
+    missing_sentences = []
+    
+    # 检查现有章节文件，确定续传点
+    existing_chapters = sorted(
+        [f for f in os.listdir(session['chapters_dir']) if f.endswith(f'.{default_audio_proc_format}')],
+        key=lambda x: int(re.search(r'\d+', x).group())
+    )
+    if existing_chapters:
+        resume_chapter = max(int(re.search(r'\d+', f).group()) for f in existing_chapters) 
+        msg = f'Resuming from block {resume_chapter}'
+        print(msg)
+        existing_chapter_numbers = {int(re.search(r'\d+', f).group()) for f in existing_chapters}
+        missing_chapters = [
+            i for i in range(1, resume_chapter) if i not in existing_chapter_numbers
+        ]
+        if resume_chapter not in missing_chapters:
+            missing_chapters.append(resume_chapter)
+            
+    # 检查现有句子文件，确定续传点
+    existing_sentences = sorted(
+        [f for f in os.listdir(session['chapters_dir_sentences']) if f.endswith(f'.{default_audio_proc_format}')],
+        key=lambda x: int(re.search(r'\d+', x).group())
+    )
+    if existing_sentences:
+        resume_sentence = max(int(re.search(r'\d+', f).group()) for f in existing_sentences)
+        msg = f"Resuming from sentence {resume_sentence}"
+        print(msg)
+        existing_sentence_numbers = {int(re.search(r'\d+', f).group()) for f in existing_sentences}
+        missing_sentences = [
+            i for i in range(1, resume_sentence) if i not in existing_sentence_numbers
+        ]
+        if resume_sentence not in missing_sentences:
+            missing_sentences.append(resume_sentence)
+            
+    return resume_chapter, resume_sentence, missing_chapters, missing_sentences
+
+def _calculate_process_distribution(session, total_sentences):
+    """Calculate chapter distribution for multiprocessing."""
+    process_rank = session.get('process_rank', 0)
+    total_processes = session.get('total_processes', 1)
+    
+    # 如果定义了多进程分片，则只处理属于当前进程的章节
+    if total_processes > 1:
+        # 计算当前进程应处理的章节范围
+        total_chapters = len(session['chapters'])
+        chunks_per_process = total_chapters // total_processes
+        remainder = total_chapters % total_processes
+        
+        # 计算起始和结束章节索引
+        start_chapter = process_rank * chunks_per_process + min(process_rank, remainder)
+        end_chapter = start_chapter + chunks_per_process + (1 if process_rank < remainder else 0)
+        
+        # 日志输出分片信息
+        print(f"[进程 {process_rank+1}] 进程 {process_rank+1}/{total_processes} 将处理章节 {start_chapter+1} 到 {end_chapter} (共{total_chapters}章)")
+        
+        # 计算当前进程需要处理的总句子数
+        process_total_sentences = 0
+        for i, chapter in enumerate(session['chapters']):
+            if start_chapter <= i < end_chapter:
+                process_total_sentences += len(get_sentences(chapter['text'], session['language']))
+        
+        print(f"[进程 {process_rank+1}] 进程 {process_rank+1} 共需处理 {process_total_sentences} 个句子")
+        
+        # 只处理分配给当前进程的章节
+        chapters_to_process = session['chapters'][start_chapter:end_chapter]
+        return chapters_to_process, process_total_sentences
+    else:
+        # 单进程模式，处理所有章节
+        print(f"单进程模式：共处理 {len(session['chapters'])} 章，{total_sentences} 个句子")
+        return session['chapters'], total_sentences
+
+def _initialize_progress_tracking(session, process_rank, total_processes, chapters_to_process, total_sentences, process_total_sentences):
+    """Initialize progress tracking variables and data structures."""
+    sentence_number = 1
+    processed_sentences = 0
+    start_time = time.time()
+    last_progress_time = start_time
+    
+    # 添加全局进度收集变量
+    if not hasattr(convert_chapters_to_audio, 'global_progress'):
+        convert_chapters_to_audio.global_progress = {}
+    
+    # 记录当前进程进度
+    convert_chapters_to_audio.global_progress[process_rank] = {
+        'rank': process_rank + 1,
+        'total_procs': total_processes,
+        'processed': processed_sentences,
+        'total': process_total_sentences if total_processes > 1 else total_sentences,
+        'current_chapter': chapters_to_process[0]['index'] if chapters_to_process else 0,
+        'chapter_range': f"{chapters_to_process[0]['index']} 到 {chapters_to_process[-1]['index']}" if chapters_to_process else "无",
+        'last_update': time.time(),
+        'sentence_number': sentence_number
+    }
+    
+    return sentence_number, processed_sentences, start_time, last_progress_time
+
+def _print_global_progress(process_rank, start_time):
+    """Print global progress summary across all processes."""
+    # 检查是否是主进程(0号进程)，只有主进程才输出汇总信息
+    if process_rank == 0 and hasattr(convert_chapters_to_audio, 'global_progress'):
+        total_processed = 0
+        total_sentences_all = 0
+        
+        # 收集所有进程的处理情况
+        process_info = []
+        for proc_rank, progress in convert_chapters_to_audio.global_progress.items():
+            if 'processed' in progress and 'total' in progress:
+                total_processed += progress.get('sentence_number', 0)
+                total_sentences_all += progress.get('total', 0)
+                process_info.append({
+                    'rank': progress.get('rank', proc_rank+1),
+                    'current_chapter': progress.get('current_chapter', 0),
+                    'chapter_range': progress.get('chapter_range', "未知"),
+                    'processed': progress.get('processed', 0),
+                    'total': progress.get('total', 0)
+                })
+        
+        # 计算总体进度
+        if total_sentences_all > 0:
+            percentage = (total_processed / total_sentences_all) * 100
+            elapsed_time = time.time() - start_time
+            if elapsed_time > 0:
+                global_speed = total_processed / elapsed_time
+                remaining_sentences = total_sentences_all - total_processed
+                if global_speed > 0:
+                    estimated_time = remaining_sentences / global_speed
+                    hours, remainder = divmod(estimated_time, 3600)
+                    minutes, seconds = divmod(remainder, 60)
+                    
+                    # 打印总体进度
+                    print(f"\n总进度: {percentage:.2f}% [{total_processed}/{total_sentences_all}] 速度: {global_speed:.2f}句/秒 ETA: {int(hours)}h {int(minutes)}m {int(seconds)}s")
+        
+        # 输出每个进程的详细信息
+        for info in process_info:
+            print(f"[进程 {info['rank']}] 当前处理章节: {info['current_chapter']} (范围: {info['chapter_range']}), 进度: {info['processed']}/{info['total']} 句")
+
+def _check_skip_chapter(session, chapter, chapter_num, sentence_number, missing_chapters, t):
+    """Check if a chapter can be skipped because it already exists."""
+    chapter_audio_file = f'{chapter_num}.{default_audio_proc_format}'
+    chapter_path = os.path.join(session['chapters_dir'], chapter_audio_file)
+    
+    if os.path.exists(chapter_path):
+        try:
+            if os.path.getsize(chapter_path) > 0:
+                try:
+                    if AudioSegment.from_file(chapter_path, format=default_audio_proc_format).duration_seconds > 0:
+                        # 如果章节文件有效，检查是否需要跳过
+                        if chapter_num < len(session['chapters']):
+                            print(f'Block {chapter_num} already exists, skipping...')
+                            sentences = get_sentences(chapter['text'], session['language'])
+                            sentence_count = len(sentences)
+                            t.update(sentence_count)
+                            return True, sentence_number + sentence_count
+                        else:
+                            # 检查最后一章是否完整
+                            sentences = get_sentences(chapter['text'], session['language'])
+                            block_size = os.path.getsize(chapter_path)
+                            if block_size > 0:
+                                # 计算句子数量
+                                num_sentences = len(sentences)
+                                # 检查句子文件
+                                sentence_files = [
+                                    f for f in os.listdir(session['chapters_dir_sentences'])
+                                    if f.endswith(f'.{default_audio_proc_format}')
+                                ]
+                                if sentence_files:
+                                    # 获取最大句子编号
+                                    max_sentence = max([int(''.join(filter(str.isdigit, os.path.basename(f)))) for f in sentence_files])
+                                    # 检查是否所有句子都已处理
+                                    if max_sentence >= sentence_number + num_sentences - 1:
+                                        print(f'Last block {chapter_num} already exists, skipping...')
+                                        sentence_count = len(sentences)
+                                        t.update(sentence_count)
+                                        return True, sentence_number + sentence_count
+                except Exception as e:
+                    DependencyError(e)
+        except Exception as e:
+            DependencyError(e)
+    
+    missing_chapters.append(chapter_num)
+    return False, sentence_number
+
+def _process_sentence(tts_manager, sentence, sentence_number, missing_sentences, resume_sentence, session):
+    """Process a single sentence and convert it to audio."""
+    # 检查是否需要转换该句子
+    if sentence_number in missing_sentences or sentence_number > resume_sentence or (sentence_number == 0 and resume_sentence == 0):
+        if sentence_number <= resume_sentence and sentence_number > 0:
+            msg = f'**Recovering missing file sentence {sentence_number}'
+            print(msg)
+            
+        # 设置句子转换参数
+        tts_manager.params['sentence_audio_file'] = os.path.join(session['chapters_dir_sentences'], f'{sentence_number}.{default_audio_proc_format}')      
+        if session['tts_engine'] == XTTSv2 or session['tts_engine'] == FAIRSEQ:
+            # 对于中文句子，特殊处理以提高朗读质量
+            if session['language'] == 'zho':
+                # 确保中文句子末尾有标点符号
+                if not any(sentence.endswith(p) for p in ['。', '！', '？', '；', '…']):
+                    sentence = sentence + '。'  # 如果没有标点，添加句号
+                
+                # 替换英文句号为中文省略号，以获得更好的停顿效果
+                tts_manager.params['sentence'] = sentence.replace('.', '…')
+            else:
+                tts_manager.params['sentence'] = sentence.replace('.', '…')
+        else:
+            tts_manager.params['sentence'] = sentence
+            
+        # 执行转换
+        if tts_manager.params['sentence'] != "":
+            if not tts_manager.convert_sentence_to_audio():
+                return False
+    
+    return True
+
+def _process_chapter(session, chapter, chapter_num, tts_manager, progress_bar, 
+                   sentence_number, processed_sentences, start_time, last_progress_time, 
+                   t, missing_chapters, missing_sentences, resume_sentence, resume_chapter, 
+                   process_rank, total_sentences, verbose_logging):
+    """Process a single chapter, converting all its sentences to audio."""
+    # 处理需要转换的章节
+    sentences = get_sentences(chapter['text'], session['language'])
+    
+    # 更新进程状态
+    convert_chapters_to_audio.global_progress[process_rank]['current_chapter'] = chapter_num
+    
+    # 章节标题（仅用于调试）
+    chapter_title = ""
+    if 'title' in chapter:
+        chapter_title = f" '{chapter['title']}'"
+    
+    # 仅在开始新章节时显示简短信息
+    if processed_sentences == 0 or (chapter_num > 1 and chapter_num != convert_chapters_to_audio.global_progress[process_rank].get('last_chapter', 0)):
+        print(f'[进程 {process_rank+1}] 处理章节 {chapter_num}')
+        convert_chapters_to_audio.global_progress[process_rank]['last_chapter'] = chapter_num
+    
+    # 记录句子起始索引
+    start = sentence_number
+    
+    if verbose_logging:
+        print(f'\n===== 开始处理章节 {chapter_num}/{len(session["chapters"])}{chapter_title} ({len(sentences)}句) =====')
+    
+    # 处理每个句子
+    for i, sentence in enumerate(sentences):
+        if session['cancellation_requested']:
+            return False, sentence_number, processed_sentences, last_progress_time
+            
+        # 检查是否需要打印进度汇总（每10秒一次）
+        current_time = time.time()
+        if current_time - last_progress_time >= 10:
+            _print_global_progress(process_rank, start_time)
+            last_progress_time = current_time
+            
+        # 处理非空句子
+        if sentence.strip():
+            sentence = sentence.strip()
+            
+            # 执行句子转换
+            if not _process_sentence(tts_manager, sentence, sentence_number, missing_sentences, resume_sentence, session):
+                return False, sentence_number, processed_sentences, last_progress_time
+                
+            # 更新进度信息并计算预计完成时间
+            processed_sentences += 1
+            convert_chapters_to_audio.global_progress[process_rank]['processed'] = processed_sentences
+            
+            # 计算和显示进度信息
+            percentage = (sentence_number / total_sentences) * 100
+            elapsed_time = time.time() - start_time
+            if processed_sentences > 0 and elapsed_time > 0:
+                sentences_per_second = processed_sentences / elapsed_time
+                remaining_sentences = total_sentences - sentence_number
+                if sentences_per_second > 0:
+                    estimated_time = remaining_sentences / sentences_per_second
+                    hours, remainder = divmod(estimated_time, 3600)
+                    minutes, seconds = divmod(remainder, 60)
+                    eta_str = f"ETA: {int(hours)}h {int(minutes)}m {int(seconds)}s"
+                    speed_str = f"速度: {sentences_per_second:.2f}句/秒"
+                    
+                    # 定期输出进度日志（仅在每10秒的进度汇总时显示，不在这里打印）
+                    # 或在详细日志模式下显示
+                    if verbose_logging and processed_sentences % 10 == 0:
+                        print(f"\n总进度: {percentage:.2f}% [{sentence_number}/{total_sentences}] {speed_str} {eta_str}")
+            
+            # 仅在详细日志模式下显示转换日志
+            if verbose_logging:
+                t.set_description(f'Converting {percentage:.2f}%: : {i+1}/{len(sentences)}')
+                msg = f'\nSentence: {sentence}'
+                print(msg)
+                
+        # 更新进度
+        t.update(1)
+        if progress_bar is not None:
+            progress_bar(sentence_number / total_sentences)
+            
+        # 递增句子编号
+        sentence_number += 1
+        convert_chapters_to_audio.global_progress[process_rank]['sentence_number'] = sentence_number
+        
+    # 显示章节处理完成
+    end = sentence_number - 1 if sentence_number > 1 else sentence_number
+    if verbose_logging:
+        msg = f"End of Block {chapter_num}"
+        print(msg)
+    
+    # 合并章节音频
+    if chapter_num in missing_chapters or end > resume_sentence:
+        if chapter_num <= resume_chapter:
+            msg = f'**Recovering missing file block {chapter_num}'
+            print(msg)
+        
+        # 合并前显示章节处理统计
+        chapter_elapsed_time = time.time() - start_time
+        chapter_sentences = end - start + 1
+        if chapter_elapsed_time > 0 and chapter_sentences > 0:
+            chapter_speed = chapter_sentences / chapter_elapsed_time
+            if verbose_logging:
+                print(f"章节 {chapter_num} 已完成: 处理 {chapter_sentences} 句，耗时 {chapter_elapsed_time:.2f}秒，速度 {chapter_speed:.2f}句/秒")
+        
+        # 执行合并
+        chapter_audio_file = f'{chapter_num}.{default_audio_proc_format}'
+        if combine_audio_sentences(chapter_audio_file, start, end, session):
+            msg = f'Combining block {chapter_num} to audio, sentence {start} to {end}'
+            print(msg)
+        else:
+            msg = 'combine_audio_sentences() failed!'
+            print(msg)
+            return False, sentence_number, processed_sentences, last_progress_time
+    
+    # 每次完成一个章节后打印进度汇总
+    _print_global_progress(process_rank, start_time)
+    return True, sentence_number, processed_sentences, last_progress_time
+
+def _print_completion_stats(processed_sentences, start_time):
+    """Print completion statistics."""
+    total_elapsed_time = time.time() - start_time
+    if total_elapsed_time > 0 and processed_sentences > 0:
+        total_speed = processed_sentences / total_elapsed_time
+        hours, remainder = divmod(total_elapsed_time, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        print(f"\n===== 转换任务完成 =====")
+        print(f"总计处理 {processed_sentences} 句，耗时 {int(hours)}小时{int(minutes)}分{int(seconds)}秒")
+        print(f"平均速度: {total_speed:.2f}句/秒")
+
 def convert_chapters_to_audio(session):
+    """Convert book chapters to audio using text-to-speech."""
     try:
         if session['cancellation_requested']:
             print('Cancel requested')
             return False
             
-        # 初始化进度条
-        progress_bar = None
-        if is_gui_process:
-            progress_bar = gr.Progress(track_tqdm=True)
-            
-        # 初始化TTS引擎    
-        tts_manager = TTSManager(session, is_gui_process)
-        if tts_manager.params['tts'] is None:
+        # 初始化TTS引擎和进度条
+        tts_manager, progress_bar = _initialize_tts_and_progress(session)
+        if tts_manager is None:
             return False
             
-        # 初始化多GPU支持
-        use_multi_gpu = (session['device'] == 'cuda' and torch.cuda.device_count() > 1)
-        if use_multi_gpu:
-            print(f"Using {torch.cuda.device_count()} GPUs for audio conversion")
-        
-        # 检查目录
-        if not os.path.exists(session['chapters_dir']):
-            os.makedirs(session['chapters_dir'], exist_ok=True)
-        if not os.path.exists(session['chapters_dir_sentences']):
-            os.makedirs(session['chapters_dir_sentences'], exist_ok=True)
-        
         # 预处理chapters数据，确保格式正确
-        formatted_chapters = []
-        if session['chapters'] is not None:
-            for idx, chapter_content in enumerate(session['chapters']):
-                # 检查chapter是否已经是字典格式
-                if isinstance(chapter_content, dict) and 'text' in chapter_content and 'index' in chapter_content:
-                    # 确保文本是字符串类型
-                    if not isinstance(chapter_content['text'], str):
-                        if isinstance(chapter_content['text'], list):
-                            chapter_content['text'] = ' '.join(str(item) for item in chapter_content['text'])
-                        else:
-                            chapter_content['text'] = str(chapter_content['text'])
-                    formatted_chapters.append(chapter_content)
-                else:
-                    # 如果是纯文本，转换为字典格式
-                    text_content = chapter_content
-                    if not isinstance(text_content, str):
-                        if isinstance(text_content, list):
-                            text_content = ' '.join(str(item) for item in text_content)
-                        else:
-                            text_content = str(text_content)
-                    formatted_chapters.append({
-                        'index': idx + 1,
-                        'text': text_content
-                    })
-        session['chapters'] = formatted_chapters
+        session['chapters'] = _prepare_chapters_data(session)
             
         # 计算总句子数，用于进度显示
         total_sentences = 0
@@ -975,144 +1335,29 @@ def convert_chapters_to_audio(session):
             sentences = get_sentences(chapter['text'], session['language'])
             total_sentences += len(sentences)
         
+        # 确定续传点
+        resume_chapter, resume_sentence, missing_chapters, missing_sentences = _determine_resume_points(session)
+        
         # 多进程分片处理逻辑
         process_rank = session.get('process_rank', 0)
         total_processes = session.get('total_processes', 1)
         
-        # 恢复处理相关变量
-        resume_chapter = 0
-        resume_sentence = 0
-        missing_chapters = []
-        missing_sentences = []
+        # 分配章节
+        chapters_to_process, process_total_sentences = _calculate_process_distribution(session, total_sentences)
         
-        # 检查现有章节文件，确定续传点
-        existing_chapters = sorted(
-            [f for f in os.listdir(session['chapters_dir']) if f.endswith(f'.{default_audio_proc_format}')],
-            key=lambda x: int(re.search(r'\d+', x).group())
+        # 初始化进度跟踪
+        sentence_number, processed_sentences, start_time, last_progress_time = _initialize_progress_tracking(
+            session, process_rank, total_processes, chapters_to_process, 
+            total_sentences, process_total_sentences
         )
-        if existing_chapters:
-            resume_chapter = max(int(re.search(r'\d+', f).group()) for f in existing_chapters) 
-            msg = f'Resuming from block {resume_chapter}'
-            print(msg)
-            existing_chapter_numbers = {int(re.search(r'\d+', f).group()) for f in existing_chapters}
-            missing_chapters = [
-                i for i in range(1, resume_chapter) if i not in existing_chapter_numbers
-            ]
-            if resume_chapter not in missing_chapters:
-                missing_chapters.append(resume_chapter)
-                
-        # 检查现有句子文件，确定续传点
-        existing_sentences = sorted(
-            [f for f in os.listdir(session['chapters_dir_sentences']) if f.endswith(f'.{default_audio_proc_format}')],
-            key=lambda x: int(re.search(r'\d+', x).group())
-        )
-        if existing_sentences:
-            resume_sentence = max(int(re.search(r'\d+', f).group()) for f in existing_sentences)
-            msg = f"Resuming from sentence {resume_sentence}"
-            print(msg)
-            existing_sentence_numbers = {int(re.search(r'\d+', f).group()) for f in existing_sentences}
-            missing_sentences = [
-                i for i in range(1, resume_sentence) if i not in existing_sentence_numbers
-            ]
-            if resume_sentence not in missing_sentences:
-                missing_sentences.append(resume_sentence)
-        
-        # 如果定义了多进程分片，则只处理属于当前进程的章节
-        if total_processes > 1:
-            # 计算当前进程应处理的章节范围
-            total_chapters = len(session['chapters'])
-            chunks_per_process = total_chapters // total_processes
-            remainder = total_chapters % total_processes
-            
-            # 计算起始和结束章节索引
-            start_chapter = process_rank * chunks_per_process + min(process_rank, remainder)
-            end_chapter = start_chapter + chunks_per_process + (1 if process_rank < remainder else 0)
-            
-            # 日志输出分片信息
-            print(f"[进程 {process_rank+1}] 进程 {process_rank+1}/{total_processes} 将处理章节 {start_chapter+1} 到 {end_chapter} (共{total_chapters}章)")
-            
-            # 计算当前进程需要处理的总句子数
-            process_total_sentences = 0
-            for i, chapter in enumerate(session['chapters']):
-                if start_chapter <= i < end_chapter:
-                    process_total_sentences += len(get_sentences(chapter['text'], session['language']))
-            
-            print(f"[进程 {process_rank+1}] 进程 {process_rank+1} 共需处理 {process_total_sentences} 个句子")
-            
-            # 只处理分配给当前进程的章节
-            chapters_to_process = session['chapters'][start_chapter:end_chapter]
-        else:
-            # 单进程模式，处理所有章节
-            chapters_to_process = session['chapters']
-            print(f"单进程模式：共处理 {len(session['chapters'])} 章，{total_sentences} 个句子")
-        
-        # 开始处理章节
-        sentence_number = 1
-        processed_sentences = 0
-        start_time = time.time()
-        last_progress_time = start_time
-        
-        # 添加全局进度收集变量
-        if not hasattr(convert_chapters_to_audio, 'global_progress'):
-            convert_chapters_to_audio.global_progress = {}
-        
-        # 记录当前进程进度
-        convert_chapters_to_audio.global_progress[process_rank] = {
-            'rank': process_rank + 1,
-            'total_procs': total_processes,
-            'processed': processed_sentences,
-            'total': process_total_sentences if total_processes > 1 else total_sentences,
-            'current_chapter': chapters_to_process[0]['index'] if chapters_to_process else 0,
-            'chapter_range': f"{chapters_to_process[0]['index']} 到 {chapters_to_process[-1]['index']}" if chapters_to_process else "无",
-            'last_update': time.time(),
-            'sentence_number': sentence_number
-        }
-        
-        # 定义汇总进度的函数
-        def print_global_progress():
-            # 检查是否是主进程(0号进程)，只有主进程才输出汇总信息
-            if process_rank == 0 and hasattr(convert_chapters_to_audio, 'global_progress'):
-                total_processed = 0
-                total_sentences_all = 0
-                
-                # 收集所有进程的处理情况
-                process_info = []
-                for proc_rank, progress in convert_chapters_to_audio.global_progress.items():
-                    if 'processed' in progress and 'total' in progress:
-                        total_processed += progress.get('sentence_number', 0)
-                        total_sentences_all += progress.get('total', 0)
-                        process_info.append({
-                            'rank': progress.get('rank', proc_rank+1),
-                            'current_chapter': progress.get('current_chapter', 0),
-                            'chapter_range': progress.get('chapter_range', "未知"),
-                            'processed': progress.get('processed', 0),
-                            'total': progress.get('total', 0)
-                        })
-                
-                # 计算总体进度
-                if total_sentences_all > 0:
-                    percentage = (total_processed / total_sentences_all) * 100
-                    elapsed_time = time.time() - start_time
-                    if elapsed_time > 0:
-                        global_speed = total_processed / elapsed_time
-                        remaining_sentences = total_sentences_all - total_processed
-                        if global_speed > 0:
-                            estimated_time = remaining_sentences / global_speed
-                            hours, remainder = divmod(estimated_time, 3600)
-                            minutes, seconds = divmod(remainder, 60)
-                            
-                            # 打印总体进度
-                            print(f"\n总进度: {percentage:.2f}% [{total_processed}/{total_sentences_all}] 速度: {global_speed:.2f}句/秒 ETA: {int(hours)}h {int(minutes)}m {int(seconds)}s")
-                
-                # 输出每个进程的详细信息
-                for info in process_info:
-                    print(f"[进程 {info['rank']}] 当前处理章节: {info['current_chapter']} (范围: {info['chapter_range']}), 进度: {info['processed']}/{info['total']} 句")
         
         # 设置是否打印详细日志的标志
         verbose_logging = session.get('verbose_logging', True)
         
         # 禁用tqdm进度条输出，避免过多的"处理中: x/y"日志
-        with tqdm(total=total_sentences, desc='处理中', bar_format='{desc}: {n_fmt}/{total_fmt}', unit='step', initial=resume_sentence, disable=True) as t:
+        with tqdm(total=total_sentences, desc='处理中', bar_format='{desc}: {n_fmt}/{total_fmt}', 
+                 unit='step', initial=resume_sentence, disable=True) as t:
+            
             for chapter in chapters_to_process:
                 if session['cancellation_requested']:
                     return False
@@ -1120,200 +1365,29 @@ def convert_chapters_to_audio(session):
                 # 获取章节编号
                 chapter_num = chapter['index']
                 
-                # 检查章节音频文件是否已存在
-                chapter_audio_file = f'{chapter_num}.{default_audio_proc_format}'
+                # 检查是否可以跳过章节处理
+                skip_chapter, new_sentence_number = _check_skip_chapter(
+                    session, chapter, chapter_num, sentence_number, missing_chapters, t
+                )
                 
-                # 验证章节文件是否已经存在并有效
-                if os.path.exists(os.path.join(session['chapters_dir'], chapter_audio_file)):
-                    try:
-                        if os.path.getsize(os.path.join(session['chapters_dir'], chapter_audio_file)) > 0:
-                            try:
-                                if AudioSegment.from_file(os.path.join(session['chapters_dir'], chapter_audio_file), format=default_audio_proc_format).duration_seconds > 0:
-                                    # 如果章节文件有效，检查是否需要跳过
-                                    if chapter_num < len(session['chapters']):
-                                        print(f'Block {chapter_num} already exists, skipping...')
-                                        sentences = get_sentences(chapter['text'], session['language'])
-                                        sentence_number += len(sentences)
-                                        convert_chapters_to_audio.global_progress[process_rank]['sentence_number'] = sentence_number
-                                        t.update(len(sentences))
-                                        continue
-                                    else:
-                                        # 检查最后一章是否完整
-                                        sentences = get_sentences(chapter['text'], session['language'])
-                                        block_size = os.path.getsize(os.path.join(session['chapters_dir'], chapter_audio_file))
-                                        if block_size > 0:
-                                            # 计算句子数量
-                                            num_sentences = len(sentences)
-                                            # 检查句子文件
-                                            sentence_files = [
-                                                f for f in os.listdir(session['chapters_dir_sentences'])
-                                                if f.endswith(f'.{default_audio_proc_format}')
-                                            ]
-                                            if sentence_files:
-                                                # 获取最大句子编号
-                                                max_sentence = max([int(''.join(filter(str.isdigit, os.path.basename(f)))) for f in sentence_files])
-                                                # 检查是否所有句子都已处理
-                                                if max_sentence >= sentence_number + num_sentences - 1:
-                                                    print(f'Last block {chapter_num} already exists, skipping...')
-                                                    sentence_number += len(sentences)
-                                                    convert_chapters_to_audio.global_progress[process_rank]['sentence_number'] = sentence_number
-                                                    t.update(len(sentences))
-                                                    continue
-                                                else:
-                                                    missing_chapters.append(chapter_num)
-                                        else:
-                                            missing_chapters.append(chapter_num)
-                            except Exception as e:
-                                DependencyError(e)
-                                missing_chapters.append(chapter_num)
-                    except Exception as e:
-                        DependencyError(e)
-                        missing_chapters.append(chapter_num)
-                else:
-                    missing_chapters.append(chapter_num)
-                    
-                # 处理需要转换的章节
-                sentences = get_sentences(chapter['text'], session['language'])
+                if skip_chapter:
+                    sentence_number = new_sentence_number
+                    convert_chapters_to_audio.global_progress[process_rank]['sentence_number'] = sentence_number
+                    continue
                 
-                # 更新进程状态
-                convert_chapters_to_audio.global_progress[process_rank]['current_chapter'] = chapter_num
+                # 处理章节
+                success, sentence_number, processed_sentences, last_progress_time = _process_chapter(
+                    session, chapter, chapter_num, tts_manager, progress_bar, 
+                    sentence_number, processed_sentences, start_time, last_progress_time, 
+                    t, missing_chapters, missing_sentences, resume_sentence, resume_chapter, 
+                    process_rank, total_sentences, verbose_logging
+                )
                 
-                # 章节标题（仅用于调试）
-                chapter_title = ""
-                if 'title' in chapter:
-                    chapter_title = f" '{chapter['title']}'"
-                
-                # 仅在开始新章节时显示简短信息
-                if processed_sentences == 0 or (chapter_num > 1 and chapter_num != convert_chapters_to_audio.global_progress[process_rank].get('last_chapter', 0)):
-                    print(f'[进程 {process_rank+1}] 处理章节 {chapter_num}')
-                    convert_chapters_to_audio.global_progress[process_rank]['last_chapter'] = chapter_num
-                
-                # 记录句子起始索引
-                start = sentence_number
-                
-                if verbose_logging:
-                    print(f'\n===== 开始处理章节 {chapter_num}/{len(session["chapters"])}{chapter_title} ({len(sentences)}句) =====')
-                
-                # 处理每个句子
-                for i, sentence in enumerate(sentences):
-                    if session['cancellation_requested']:
-                        return False
-                        
-                    # 检查是否需要打印进度汇总（每10秒一次）
-                    current_time = time.time()
-                    if current_time - last_progress_time >= 10:
-                        print_global_progress()
-                        last_progress_time = current_time
-                        
-                    # 处理非空句子
-                    if sentence.strip():
-                        sentence = sentence.strip()
-                        
-                        # 检查是否需要转换该句子
-                        if sentence_number in missing_sentences or sentence_number > resume_sentence or (sentence_number == 0 and resume_sentence == 0):
-                            if sentence_number <= resume_sentence and sentence_number > 0:
-                                msg = f'**Recovering missing file sentence {sentence_number}'
-                                print(msg)
-                                
-                            # 设置句子转换参数
-                            tts_manager.params['sentence_audio_file'] = os.path.join(session['chapters_dir_sentences'], f'{sentence_number}.{default_audio_proc_format}')      
-                            if session['tts_engine'] == XTTSv2 or session['tts_engine'] == FAIRSEQ:
-                                # 对于中文句子，特殊处理以提高朗读质量
-                                if session['language'] == 'zho':
-                                    # 确保中文句子末尾有标点符号
-                                    if not any(sentence.endswith(p) for p in ['。', '！', '？', '；', '…']):
-                                        sentence = sentence + '。'  # 如果没有标点，添加句号
-                                    
-                                    # 替换英文句号为中文省略号，以获得更好的停顿效果
-                                    tts_manager.params['sentence'] = sentence.replace('.', '…')
-                                else:
-                                    tts_manager.params['sentence'] = sentence.replace('.', '…')
-                            else:
-                                tts_manager.params['sentence'] = sentence
-                                
-                            # 执行转换
-                            if tts_manager.params['sentence'] != "":
-                                if tts_manager.convert_sentence_to_audio():                           
-                                    percentage = (sentence_number / total_sentences) * 100
-                                    
-                                    # 更新进度信息并计算预计完成时间
-                                    processed_sentences += 1
-                                    convert_chapters_to_audio.global_progress[process_rank]['processed'] = processed_sentences
-                                    
-                                    elapsed_time = time.time() - start_time
-                                    if processed_sentences > 0 and elapsed_time > 0:
-                                        sentences_per_second = processed_sentences / elapsed_time
-                                        remaining_sentences = total_sentences - sentence_number
-                                        if sentences_per_second > 0:
-                                            estimated_time = remaining_sentences / sentences_per_second
-                                            hours, remainder = divmod(estimated_time, 3600)
-                                            minutes, seconds = divmod(remainder, 60)
-                                            eta_str = f"ETA: {int(hours)}h {int(minutes)}m {int(seconds)}s"
-                                            speed_str = f"速度: {sentences_per_second:.2f}句/秒"
-                                            
-                                            # 定期输出进度日志（仅在每10秒的进度汇总时显示，不在这里打印）
-                                            # 或在详细日志模式下显示
-                                            if verbose_logging and processed_sentences % 10 == 0:
-                                                print(f"\n总进度: {percentage:.2f}% [{sentence_number}/{total_sentences}] {speed_str} {eta_str}")
-                                    
-                                    # 仅在详细日志模式下显示转换日志
-                                    if verbose_logging:
-                                        t.set_description(f'Converting {percentage:.2f}%: : {i+1}/{len(sentences)}')
-                                        msg = f'\nSentence: {sentence}'
-                                        print(msg)
-                                else:
-                                    return False
-                                    
-                        # 更新进度
-                        t.update(1)
-                        if progress_bar is not None:
-                            progress_bar(sentence_number / total_sentences)
-                            
-                        # 递增句子编号
-                        sentence_number += 1
-                        convert_chapters_to_audio.global_progress[process_rank]['sentence_number'] = sentence_number
-                        
-                # 显示章节处理完成
-                end = sentence_number - 1 if sentence_number > 1 else sentence_number
-                if verbose_logging:
-                    msg = f"End of Block {chapter_num}"
-                    print(msg)
-                
-                # 合并章节音频
-                if chapter_num in missing_chapters or end > resume_sentence:
-                    if chapter_num <= resume_chapter:
-                        msg = f'**Recovering missing file block {chapter_num}'
-                        print(msg)
-                    
-                    # 合并前显示章节处理统计
-                    chapter_elapsed_time = time.time() - start_time
-                    chapter_sentences = end - start + 1
-                    if chapter_elapsed_time > 0 and chapter_sentences > 0:
-                        chapter_speed = chapter_sentences / chapter_elapsed_time
-                        if verbose_logging:
-                            print(f"章节 {chapter_num} 已完成: 处理 {chapter_sentences} 句，耗时 {chapter_elapsed_time:.2f}秒，速度 {chapter_speed:.2f}句/秒")
-                    
-                    # 执行合并
-                    if combine_audio_sentences(chapter_audio_file, start, end, session):
-                        msg = f'Combining block {chapter_num} to audio, sentence {start} to {end}'
-                        print(msg)
-                    else:
-                        msg = 'combine_audio_sentences() failed!'
-                        print(msg)
-                        return False
-                
-                # 每次完成一个章节后打印进度汇总
-                print_global_progress()
+                if not success:
+                    return False
                         
         # 显示总体完成统计
-        total_elapsed_time = time.time() - start_time
-        if total_elapsed_time > 0 and processed_sentences > 0:
-            total_speed = processed_sentences / total_elapsed_time
-            hours, remainder = divmod(total_elapsed_time, 3600)
-            minutes, seconds = divmod(remainder, 60)
-            print(f"\n===== 转换任务完成 =====")
-            print(f"总计处理 {processed_sentences} 句，耗时 {int(hours)}小时{int(minutes)}分{int(seconds)}秒")
-            print(f"平均速度: {total_speed:.2f}句/秒")
+        _print_completion_stats(processed_sentences, start_time)
         
         return True
     except Exception as e:
